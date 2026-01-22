@@ -19,7 +19,6 @@ struct Light
     int CastsShadows;
     int isDebugOn;
     float4x4 gWorld;
-     // --- New Shadow Property ---
     float4x4 LightViewProj; // World space to Light's clip space for shadow mapping
     // Potentially an index if using a texture array for shadow maps
     // uint ShadowMapIndex;

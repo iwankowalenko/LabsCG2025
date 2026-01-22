@@ -2,11 +2,11 @@
 
 
 #include "LightingUtil.hlsl"
-Texture2D gShadowTexture : register(t4); 
-Texture2D gShadowMap : register(t3); 
-Texture2D gPositionMap : register(t2);
+Texture2D gPositionMap : register(t0);
 Texture2D gNormalMap : register(t1);
-Texture2D gAlbedoMap : register(t0);
+Texture2D gAlbedoMap : register(t2);
+Texture2D gShadowMap : register(t3);
+Texture2D gShadowTexture : register(t4);
 SamplerState gsamPointWrap : register(s0);
 SamplerState gsamPointClamp : register(s1);
 SamplerState gsamLinearWrap : register(s2);
@@ -197,6 +197,7 @@ float4 PS(VSOut pin) : SV_TARGET
 
     return litColor;
 }
+
 float4 PS_debug(VSOut pin) : SV_TARGET
 {
     return float4(1, 1, 1, 1);

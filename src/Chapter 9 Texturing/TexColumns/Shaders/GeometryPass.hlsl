@@ -1,4 +1,3 @@
-// GBuffer.hlsl
 
 #include "LightingUtil.hlsl"
 Texture2D gDiffuseMap : register(t0);
@@ -18,6 +17,7 @@ cbuffer cbPerObject : register(b0)
     float4x4 gWorld;
     float4x4 gInvWorld;
     float4x4 gTexTransform;
+    float4x4 gPrevWorld;
 };
 
 // Constant data that varies per material.
@@ -38,6 +38,11 @@ cbuffer cbPass : register(b1)
     float gTotalTime;
     float gDeltaTime;
     float4 gAmbientLight;
+    float4x4 gViewProjNoJitter; // NEW
+    float4x4 gPrevViewProjNoJitter; // NEW
+    float4x4 gPrevViewProj;
+    float2 gCurrJitterUV;
+    float2 gPrevJitterUV;
 
     // Indices [0, NUM_DIR_LIGHTS) are directional lights;
     // indices [NUM_DIR_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHTS) are point lights;
@@ -69,30 +74,38 @@ struct VertexOut
     float3 NormalW : NORMAL;
     float2 TexC : TEXCOORD;
     float3 Tan : TANGENT;
+
+    float4 CurrClip : TEXCOORD1; // NDC current (no jitter)
+    float4 PrevClip : TEXCOORD2; // NDC previous (no jitter)
 };
+
 
 VertexOut VS(VertexIn vin)
 {
-    VertexOut vout = (VertexOut) 0.0f;
-    // Transform to world space.
-    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
-    vout.PosW = posW;
+    VertexOut vout = (VertexOut) 0;
 
+    float4 posW = mul(float4(vin.PosL, 1.0f), gWorld);
+    vout.PosW = posW.xyz;
+
+    // rasterization uses jittered VP
     vout.PosH = mul(posW, gViewProj);
-    
+
+    // velocity uses no-jitter VP
+    vout.CurrClip = mul(posW, gViewProjNoJitter);
+
+    float4 prevW = mul(float4(vin.PosL, 1.0f), gPrevWorld);
+    vout.PrevClip = mul(prevW, gPrevViewProjNoJitter);
+
     float4 texC = mul(float4(vin.TexC, 0.0f, 1.0f), gTexTransform);
     vout.TexC = mul(texC, gMatTransform).xy;
-    
-    // Assumes nonuniform scaling; otherwise, need to use inverse-transpose of world matrix.
+
     vout.NormalW = mul(vin.NormalL, (float3x3) gWorld);
     vout.Tan = mul(vin.Tan, (float3x3) gWorld);
-    // Transform to homogeneous clip space.
 
-	// Output vertex attributes for interpolation across triangle.
- 
-    
     return vout;
 }
+
+
 
 // PSOutput с несколькими буферами
 struct PSOutput
@@ -100,6 +113,7 @@ struct PSOutput
     float4 Albedo : SV_Target0; // Diffuse color
     float4 Normal : SV_Target1; // Normal.xyz, alpha можно задать =1
     float4 Position : SV_Target2; // Position.xyz, alpha=1
+    float2 Velocity : SV_Target3; // формат R16G16_FLOAT
 };
 
 float3 NormalSampleToWorldSpace(float3 normalMapSample, float3 unitNormalW, float3 tangentW)
@@ -123,23 +137,31 @@ float3 NormalSampleToWorldSpace(float3 normalMapSample, float3 unitNormalW, floa
 PSOutput PS(VertexOut pin)
 {
     PSOutput outt;
-    // Сэмплим диффузную текстуру
-    float4 diffuseTex = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
-    outt.Albedo = diffuseTex * gDiffuseAlbedo; // альбедо (RGB), альфа можем взять из diffuseAlbedo.a
 
-    // Обрабатываем нормаль: из карты или вершинная
-    float3 normalW;
-    // Сэмплируем карту нормалей в неликвидном пространстве (0..1 -> -1..1)
+    float4 diffuseTex = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
+    outt.Albedo = diffuseTex * gDiffuseAlbedo;
+
     float3 normalSample = gNormalMap.Sample(gsamAnisotropicWrap, pin.TexC).xyz;
     pin.NormalW = normalize(pin.NormalW);
-    normalW = NormalSampleToWorldSpace(normalSample.rgb, pin.NormalW, pin.Tan);;
-
+    float3 normalW = NormalSampleToWorldSpace(normalSample.rgb, pin.NormalW, pin.Tan);
     outt.Normal = float4(normalW, 1.0f);
 
-    // Позиция в мировых координатах
     outt.Position = float4(pin.PosW, 1.0f);
 
-    
-    
+    // Velocity (UV offset)
+    float invWc = (abs(pin.CurrClip.w) > 1e-6f) ? (1.0f / pin.CurrClip.w) : 0.0f;
+    float invWp = (abs(pin.PrevClip.w) > 1e-6f) ? (1.0f / pin.PrevClip.w) : 0.0f;
+
+    float2 currNdc = pin.CurrClip.xy * invWc;
+    float2 prevNdc = pin.PrevClip.xy * invWp;
+
+// NDC velocity
+    float2 velNdc = prevNdc - currNdc;
+
+// NDC -> UV offset
+    float2 velUV = velNdc * float2(0.5f, -0.5f);
+    outt.Velocity = velUV;
+
+
     return outt;
 }
