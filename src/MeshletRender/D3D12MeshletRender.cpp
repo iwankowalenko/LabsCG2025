@@ -1,4 +1,5 @@
 //Переключение режима показа мешлетов/текстур на 519 строчке!!!
+// add dop for 5 lab
 #include "stdafx.h"
 #include "D3D12MeshletRender.h"
 #include <wincodec.h>
