@@ -56,6 +56,8 @@ cbuffer cbMaterial : register(b2)
     float4 gDiffuseAlbedo;
     float3 gFresnelR0;
     float gRoughness;
+    float gMetallic;
+    float3 _padMetallic;
     float4x4 gMatTransform;
 };
 
@@ -140,11 +142,14 @@ PSOutput PS(VertexOut pin)
 
     float4 diffuseTex = gDiffuseMap.Sample(gsamAnisotropicWrap, pin.TexC);
     outt.Albedo = diffuseTex * gDiffuseAlbedo;
+    // Pack roughness into Albedo.a for deferred PBR.
+    outt.Albedo.a = gRoughness;
 
     float3 normalSample = gNormalMap.Sample(gsamAnisotropicWrap, pin.TexC).xyz;
     pin.NormalW = normalize(pin.NormalW);
     float3 normalW = NormalSampleToWorldSpace(normalSample.rgb, pin.NormalW, pin.Tan);
-    outt.Normal = float4(normalW, 1.0f);
+    // Pack metallic into Normal.a for deferred PBR.
+    outt.Normal = float4(normalW, gMetallic);
 
     outt.Position = float4(pin.PosW, 1.0f);
 

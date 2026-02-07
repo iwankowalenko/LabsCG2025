@@ -260,6 +260,8 @@ struct MaterialConstants
 	DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
 	DirectX::XMFLOAT3 FresnelR0 = { 0.01f, 0.01f, 0.01f };
 	float Roughness = 0.25f;
+	float Metallic = 0.0f;
+	DirectX::XMFLOAT3 _padMetallic = { 0.0f, 0.0f, 0.0f };
 
 	// Used in texture mapping.
 	DirectX::XMFLOAT4X4 MatTransform = MathHelper::Identity4x4();
@@ -291,6 +293,7 @@ struct Material
 	DirectX::XMFLOAT4 DiffuseAlbedo = { 1.0f, 1.0f, 1.0f, 1.0f };
 	DirectX::XMFLOAT3 FresnelR0 = { 0.01f, 0.01f, 0.01f };
 	float Roughness = .25f;
+	float Metallic = 0.0f;
 	DirectX::XMFLOAT4X4 MatTransform = MathHelper::Identity4x4();
 };
 
@@ -303,6 +306,19 @@ struct Texture
 
 	Microsoft::WRL::ComPtr<ID3D12Resource> Resource = nullptr;
 	Microsoft::WRL::ComPtr<ID3D12Resource> UploadHeap = nullptr;
+};
+
+// Atmosphere (real-time params: clean vs dirty, sun) — used by lighting/sky pass
+// Rayleigh/Mie in 0..1 (artist range). Turbidity 1=clear, 2+=hazy.
+struct AtmosphereConstants
+{
+	DirectX::XMFLOAT3 SunDirection = { 0.2f, -0.95f, 0.2f };
+	float SunStrength = 5.0f;
+	float Rayleigh = 0.8f;   // 0..1: blue/clean sky strength
+	float Mie = 0.15f;    // 0..1: haze/aerosols
+	float Turbidity = 1.0f;     // 1 = clear, 2+ = dirty/hazy
+	float BlendWithCubemap = 0.0f; // 0 = atmosphere only, 1 = cubemap only
+	DirectX::XMFLOAT2 _padAtmosphere = { 0, 0 };
 };
 
 #ifndef ThrowIfFailed

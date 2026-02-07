@@ -1,6 +1,7 @@
 //***************************************************************************************
 // TexColumnsApp.cpp by Frank Luna (C) 2015 All Rights Reserved.
 //***************************************************************************************
+#include "../../Common/d3dUtil.h"
 #include "../../Common/Camera.h"
 #include "../../Common/d3dApp.h"
 #include "../../Common/MathHelper.h"
@@ -11,6 +12,7 @@
 #include <iostream>
 #include <algorithm> 
 #include <cmath>
+#include <cctype>
 
 
 #include "imgui_impl_dx12.h"
@@ -142,7 +144,7 @@ private:
 	void BuildPSOs();
 	void BuildFrameResources();
 	void RotateSpotlightTowardCursor(int x, int y);
-	void CreateMaterial(std::string _name, int _CBIndex, int _SRVDiffIndex, int _SRVNMapIndex, XMFLOAT4 _DiffuseAlbedo, XMFLOAT3 _FresnelR0, float _Roughness);
+	void CreateMaterial(std::string _name, int _CBIndex, int _SRVDiffIndex, int _SRVNMapIndex, XMFLOAT4 _DiffuseAlbedo, XMFLOAT3 _FresnelR0, float _Roughness, float _Metallic);
 	void BuildMaterials();
 	void RenderCustomMesh(std::string unique_name, std::string meshname, std::string materialName, XMFLOAT3 Scale, XMFLOAT3 Rotation, XMFLOAT3 Position);
 	void BuildCustomMeshGeometry(std::string name, UINT& meshVertexOffset, UINT& meshIndexOffset, UINT& prevVertSize, UINT& prevIndSize, std::vector<Vertex>& vertices, std::vector<std::uint16_t>& indices, MeshGeometry* Geo);
@@ -270,6 +272,9 @@ private:
 	CD3DX12_GPU_DESCRIPTOR_HANDLE mDepthSrvHandle{};
 	UINT mDepthSrvHeapIndex = 0;
 	std::unique_ptr<UploadBuffer<TAAReprojectConstants>> mTaaReprojectCB = nullptr;
+
+	std::unique_ptr<UploadBuffer<AtmosphereConstants>> mAtmosphereCB = nullptr;
+	AtmosphereConstants mAtmosphereParams;
 
 	Microsoft::WRL::ComPtr<ID3D12Resource> mTaaDepthHistory[2];
 	CD3DX12_GPU_DESCRIPTOR_HANDLE mTaaDepthHistorySrv[2];
@@ -1005,6 +1010,26 @@ void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 		currLightCB->CopyData(l.LightCBIndex, lConst);
 		lId++;
 	}
+
+	// Sync first directional light to atmosphere sun (for sky + reflections)
+	for (const auto& l : mLights)
+		if (l.type == 2) {
+			XMVECTOR d = XMLoadFloat3(&l.Direction);
+			XMStoreFloat3(&mAtmosphereParams.SunDirection, XMVector3Normalize(d));
+			mAtmosphereParams.SunStrength = l.Strength;
+			break;
+		}
+
+	// Atmosphere: real-time params (clean vs dirty)
+	ImGui::Separator();
+	ImGui::Text("Atmosphere (sky)");
+	ImGui::DragFloat("Rayleigh (0..1, blue/clean sky)", &mAtmosphereParams.Rayleigh, 0.02f, 0.0f, 2.0f);
+	ImGui::DragFloat("Mie (0..1, haze)", &mAtmosphereParams.Mie, 0.02f, 0.0f, 1.0f);
+	ImGui::DragFloat("Turbidity (1=clear, 2+=dirty)", &mAtmosphereParams.Turbidity, 0.05f, 0.5f, 5.0f);
+	ImGui::DragFloat("Blend cubemap (0=atmosphere, 1=cubemap)", &mAtmosphereParams.BlendWithCubemap, 0.02f, 0.0f, 1.0f);
+
+	if (mAtmosphereCB != nullptr)
+		mAtmosphereCB->CopyData(0, mAtmosphereParams);
 }
 
 void TexColumnsApp::UpdateMaterialCBs(const GameTimer& gt)
@@ -1024,6 +1049,7 @@ void TexColumnsApp::UpdateMaterialCBs(const GameTimer& gt)
 			matConstants.DiffuseAlbedo = mat->DiffuseAlbedo;
 			matConstants.FresnelR0 = mat->FresnelR0;
 			matConstants.Roughness = mat->Roughness;
+			matConstants.Metallic = mat->Metallic;
 			XMStoreFloat4x4(&matConstants.MatTransform, XMMatrixTranspose(matTransform));
 
 			currMaterialCB->CopyData(mat->MatCBIndex, matConstants);
@@ -1245,6 +1271,26 @@ void TexColumnsApp::LoadAllTextures()
 			LoadTexture(filepath);
 		}
 	}
+
+	// PBR IBL textures + skybox (expected to be in ../../Textures/ or ../../Textures/textures/).
+	// If they are missing, we just skip them (so the app doesn't crash building SRVs).
+	auto tryLoad = [&](const std::string& texName)
+		{
+			if (mTextures.find(texName) == mTextures.end())
+				LoadTexture(texName);
+		};
+
+	// Root Textures folder
+	tryLoad("prefiltered");
+	tryLoad("irradiance");
+	tryLoad("brdfLUT");
+	tryLoad("skybox");
+
+	// Fallback: textures/ subfolder (if you placed them there)
+	tryLoad("textures/prefiltered");
+	tryLoad("textures/irradiance");
+	tryLoad("textures/brdfLUT");
+	tryLoad("textures/skybox");
 }
 
 void TexColumnsApp::LoadTexture(const std::string& name)
@@ -1253,9 +1299,19 @@ void TexColumnsApp::LoadTexture(const std::string& name)
 	tex->Name = name;
 	tex->Filename = L"../../Textures/" + std::wstring(name.begin(), name.end()) + L".dds";
 
+	if (!std::filesystem::exists(std::filesystem::path(tex->Filename)))
+	{
+		std::cout << "[LoadTexture] File not found: " << name << "\n";
+		return;
+	}
+
 	if (FAILED(DirectX::CreateDDSTextureFromFile12(md3dDevice.Get(),
 		mCommandList.Get(), tex->Filename.c_str(),
-		tex->Resource, tex->UploadHeap))) std::cout << name << "\n";
+		tex->Resource, tex->UploadHeap)))
+	{
+		std::cout << "[LoadTexture] Failed to load: " << name << "\n";
+		return;
+	}
 	mTextures[name] = std::move(tex);
 }
 
@@ -1308,6 +1364,7 @@ void TexColumnsApp::BuildRootSignature()
 void TexColumnsApp::BuildLightingRootSignature()
 {
 	// t0 = Position, t1 = Normal, t2 = Albedo, t3 = ShadowMap, t4 = ShadowTexture, t5 = Velocity
+	// t6 = Irradiance (cube), t7 = Prefiltered (cube), t8 = BRDF LUT (2D), t9 = Skybox (cube)
 
 	CD3DX12_DESCRIPTOR_RANGE rAlbedo;
 	rAlbedo.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
@@ -1327,7 +1384,19 @@ void TexColumnsApp::BuildLightingRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE rVelocity;
 	rVelocity.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5
 
-	CD3DX12_ROOT_PARAMETER rootParams[10];
+	CD3DX12_DESCRIPTOR_RANGE rIrradiance;
+	rIrradiance.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6); // t6
+
+	CD3DX12_DESCRIPTOR_RANGE rPrefiltered;
+	rPrefiltered.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7); // t7
+
+	CD3DX12_DESCRIPTOR_RANGE rBrdfLut;
+	rBrdfLut.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8); // t8
+
+	CD3DX12_DESCRIPTOR_RANGE rSkybox;
+	rSkybox.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9); // t9
+
+	CD3DX12_ROOT_PARAMETER rootParams[15];
 	rootParams[0].InitAsDescriptorTable(1, &rAlbedo, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParams[1].InitAsDescriptorTable(1, &rNormal, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParams[2].InitAsDescriptorTable(1, &rPosition, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -1341,6 +1410,11 @@ void TexColumnsApp::BuildLightingRootSignature()
 	rootParams[8].InitAsDescriptorTable(1, &rVelocity, D3D12_SHADER_VISIBILITY_PIXEL);  // t5
 	// b3: debug constants (root constants)
 	rootParams[9].InitAsConstants(4, 3, 0, D3D12_SHADER_VISIBILITY_PIXEL);
+	rootParams[10].InitAsDescriptorTable(1, &rIrradiance, D3D12_SHADER_VISIBILITY_PIXEL);  // t6
+	rootParams[11].InitAsDescriptorTable(1, &rPrefiltered, D3D12_SHADER_VISIBILITY_PIXEL); // t7
+	rootParams[12].InitAsDescriptorTable(1, &rBrdfLut, D3D12_SHADER_VISIBILITY_PIXEL);     // t8
+	rootParams[13].InitAsDescriptorTable(1, &rSkybox, D3D12_SHADER_VISIBILITY_PIXEL);      // t9
+	rootParams[14].InitAsConstantBufferView(4); // b4 = cbAtmosphere
 
 	auto staticSamplers = GetStaticSamplers();
 
@@ -1446,7 +1520,7 @@ void TexColumnsApp::BuildPostProcessRootSignature()
 }
 void TexColumnsApp::CreatePointLight(XMFLOAT3 pos, XMFLOAT3 color, float faloff_start, float faloff_end, float strength)
 {
-	Light light;
+	Light light = {};
 	light.LightCBIndex = mLights.size();
 
 	light.Position = pos;
@@ -1454,13 +1528,18 @@ void TexColumnsApp::CreatePointLight(XMFLOAT3 pos, XMFLOAT3 color, float faloff_
 	light.FalloffStart = faloff_start;
 	light.FalloffEnd = faloff_end;
 	light.type = 1;
+	light.Strength = strength;
+	light.CastsShadows = false;
+	light.enablePCF = false;
+	light.pcf_level = 0;
+	light.isDebugOn = false;
 	auto& world = XMMatrixScaling(faloff_end * 2, faloff_end * 2, faloff_end * 2) * XMMatrixTranslation(pos.x, pos.y, pos.z);
 	XMStoreFloat4x4(&light.gWorld, XMMatrixTranspose(world));
 	mLights.push_back(light);
 }
 void TexColumnsApp::CreateSpotLight(XMFLOAT3 pos, XMFLOAT3 rot, XMFLOAT3 color, float faloff_start, float faloff_end, float strength, float spotpower)
 {
-	Light light;
+	Light light = {};
 	light.LightCBIndex = mLights.size();
 
 	light.Position = pos;
@@ -1472,30 +1551,41 @@ void TexColumnsApp::CreateSpotLight(XMFLOAT3 pos, XMFLOAT3 rot, XMFLOAT3 color, 
 	light.type = 3;
 	light.Strength = strength;
 	light.SpotPower = spotpower;
+	light.CastsShadows = false;
+	light.enablePCF = false;
+	light.pcf_level = 0;
+	light.isDebugOn = false;
 	mLights.push_back(light);
 }
 
 void TexColumnsApp::BuildLights()
 {
-	// directional
-	Light dir;
+	// directional (strong main light so reflections are visible on spheres)
+	Light dir = {};
 	dir.LightCBIndex = mLights.size();
 	dir.Position = { 0,300,0 };
-	dir.Direction = { 0, -1, 0 };
+	dir.Direction = { 0.2f, -0.95f, 0.2f }; // slightly from above-front for clear highlights
 	dir.Color = { 1,1,1 };
-	dir.Strength = 0;
+	dir.Strength = 3.0f;
 	dir.CastsShadows = false;
+	dir.enablePCF = false;
+	dir.pcf_level = 0;
+	dir.isDebugOn = false;
 	dir.type = 2;
 	dir.LightUp = XMVectorSet(0, 0, -1, 0);
 	auto& world = XMMatrixScaling(1000, 1000, 1000);
 	XMStoreFloat4x4(&dir.gWorld, XMMatrixTranspose(world));
 	mLights.push_back(dir);
 
-	Light ambient;
+	Light ambient = {};
 	ambient.LightCBIndex = mLights.size();
 	ambient.Position = { 3.0f, 0.0f, 3.0f };
 	ambient.Color = { 0,0,0 }; // need only x
 	ambient.Strength = 0.3; // need only x
+	ambient.CastsShadows = false;
+	ambient.enablePCF = false;
+	ambient.pcf_level = 0;
+	ambient.isDebugOn = false;
 	ambient.type = 0;
 	XMStoreFloat4x4(&ambient.gWorld, XMMatrixTranspose(XMMatrixTranslation(0, 0, 0) * XMMatrixScaling(1000, 1000, 1000)));
 	mLights.push_back(ambient);
@@ -1524,7 +1614,7 @@ void TexColumnsApp::SetLightShapes()
 	mLights;
 }
 
-void TexColumnsApp::CreateMaterial(std::string _name, int _CBIndex, int _SRVDiffIndex, int _SRVNMapIndex, XMFLOAT4 _DiffuseAlbedo, XMFLOAT3 _FresnelR0, float _Roughness)
+void TexColumnsApp::CreateMaterial(std::string _name, int _CBIndex, int _SRVDiffIndex, int _SRVNMapIndex, XMFLOAT4 _DiffuseAlbedo, XMFLOAT3 _FresnelR0, float _Roughness, float _Metallic)
 {
 
 	auto material = std::make_unique<Material>();
@@ -1535,6 +1625,7 @@ void TexColumnsApp::CreateMaterial(std::string _name, int _CBIndex, int _SRVDiff
 	material->DiffuseAlbedo = _DiffuseAlbedo;
 	material->FresnelR0 = _FresnelR0;
 	material->Roughness = _Roughness;
+	material->Metallic = _Metallic;
 	mMaterials[_name] = std::move(material);
 }
 
@@ -1676,44 +1767,115 @@ void TexColumnsApp::BuildDescriptorHeaps()
 		};
 
 	// 2) Regular textures SRVs
-	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-
 	int texIndex = 0;
+	auto isCubeName = [&](const std::string& name) -> bool
+		{
+			std::string s = name;
+			std::transform(s.begin(), s.end(), s.begin(),
+				[](unsigned char c) { return (char)std::tolower(c); });
+
+			return (s.find("cube") != std::string::npos) ||
+				(s.find("skybox") != std::string::npos) ||
+				(s.find("irradiance") != std::string::npos) ||
+				(s.find("prefilter") != std::string::npos);
+		};
+
 	for (const auto& kv : mTextures)
 	{
 		auto res = kv.second->Resource;
-		DXGI_FORMAT format = res->GetDesc().Format;
+		auto texDesc = res->GetDesc();
+		DXGI_FORMAT format = texDesc.Format;
 		if (format == DXGI_FORMAT_UNKNOWN)
 			abort();
 
-		srvDesc.Format = format;
-		srvDesc.Texture2D.MipLevels = res->GetDesc().MipLevels;
-		srvDesc.Texture2D.MostDetailedMip = 0;
-		srvDesc.Texture2D.PlaneSlice = 0;
-		srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+		D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+		desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		desc.Format = format;
 
-		md3dDevice->CreateShaderResourceView(res.Get(), &srvDesc, cpuAt(baseTextures + texIndex));
+		if (texDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+		{
+			desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+			desc.Texture3D.MostDetailedMip = 0;
+			desc.Texture3D.MipLevels = texDesc.MipLevels;
+			desc.Texture3D.ResourceMinLODClamp = 0.0f;
+		}
+		else if (texDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D)
+		{
+			const UINT arraySize = texDesc.DepthOrArraySize;
+
+			// Cubemap(s)
+			const bool cubeCandidate = (arraySize >= 6) && ((arraySize % 6) == 0) && isCubeName(kv.first);
+			if (cubeCandidate)
+			{
+				if (arraySize == 6)
+				{
+					desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+					desc.TextureCube.MostDetailedMip = 0;
+					desc.TextureCube.MipLevels = texDesc.MipLevels;
+					desc.TextureCube.ResourceMinLODClamp = 0.0f;
+				}
+				else
+				{
+					desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+					desc.TextureCubeArray.MostDetailedMip = 0;
+					desc.TextureCubeArray.MipLevels = texDesc.MipLevels;
+					desc.TextureCubeArray.First2DArrayFace = 0;
+					desc.TextureCubeArray.NumCubes = arraySize / 6;
+					desc.TextureCubeArray.ResourceMinLODClamp = 0.0f;
+				}
+			}
+			else if (arraySize > 1)
+			{
+				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+				desc.Texture2DArray.MostDetailedMip = 0;
+				desc.Texture2DArray.MipLevels = texDesc.MipLevels;
+				desc.Texture2DArray.FirstArraySlice = 0;
+				desc.Texture2DArray.ArraySize = arraySize;
+				desc.Texture2DArray.PlaneSlice = 0;
+				desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+			}
+			else
+			{
+				desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+				desc.Texture2D.MostDetailedMip = 0;
+				desc.Texture2D.MipLevels = texDesc.MipLevels;
+				desc.Texture2D.PlaneSlice = 0;
+				desc.Texture2D.ResourceMinLODClamp = 0.0f;
+			}
+		}
+		else
+		{
+			// Fallback: treat as a simple 2D texture SRV.
+			desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			desc.Texture2D.MostDetailedMip = 0;
+			desc.Texture2D.MipLevels = texDesc.MipLevels;
+			desc.Texture2D.PlaneSlice = 0;
+			desc.Texture2D.ResourceMinLODClamp = 0.0f;
+		}
+
+		md3dDevice->CreateShaderResourceView(res.Get(), &desc, cpuAt(baseTextures + texIndex));
 
 		TexOffsets[kv.first] = texIndex;
 		texIndex++;
 	}
 
 	// 3) GBuffer SRV
-	srvDesc.Texture2D.MipLevels = 1;
-	srvDesc.Texture2D.MostDetailedMip = 0;
-	srvDesc.Texture2D.PlaneSlice = 0;
-	srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+	D3D12_SHADER_RESOURCE_VIEW_DESC gbufSrvDesc = {};
+	gbufSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	gbufSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	gbufSrvDesc.Texture2D.MipLevels = 1;
+	gbufSrvDesc.Texture2D.MostDetailedMip = 0;
+	gbufSrvDesc.Texture2D.PlaneSlice = 0;
+	gbufSrvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
 
-	srvDesc.Format = albedoFormat;
-	md3dDevice->CreateShaderResourceView(mGBufferAlbedo.Get(), &srvDesc, cpuAt(baseGbuffer + 0));
+	gbufSrvDesc.Format = albedoFormat;
+	md3dDevice->CreateShaderResourceView(mGBufferAlbedo.Get(), &gbufSrvDesc, cpuAt(baseGbuffer + 0));
 
-	srvDesc.Format = normalFormat;
-	md3dDevice->CreateShaderResourceView(mGBufferNormal.Get(), &srvDesc, cpuAt(baseGbuffer + 1));
+	gbufSrvDesc.Format = normalFormat;
+	md3dDevice->CreateShaderResourceView(mGBufferNormal.Get(), &gbufSrvDesc, cpuAt(baseGbuffer + 1));
 
-	srvDesc.Format = positionFormat;
-	md3dDevice->CreateShaderResourceView(mGBufferPosition.Get(), &srvDesc, cpuAt(baseGbuffer + 2));
+	gbufSrvDesc.Format = positionFormat;
+	md3dDevice->CreateShaderResourceView(mGBufferPosition.Get(), &gbufSrvDesc, cpuAt(baseGbuffer + 2));
 
 	// Velocity SRV (отдельным desc)
 	D3D12_SHADER_RESOURCE_VIEW_DESC velSrvDesc = {};
@@ -1826,10 +1988,10 @@ void TexColumnsApp::BuildShadersAndInputLayout()
 	mShaders["opaquePS"] = d3dUtil::CompileShader(L"Shaders\\Default.hlsl", nullptr, "PS", "ps_5_1");
 	mShaders["gbufferVS"] = d3dUtil::CompileShader(L"Shaders\\GeometryPass.hlsl", nullptr, "VS", "vs_5_0");
 	mShaders["gbufferPS"] = d3dUtil::CompileShader(L"Shaders\\GeometryPass.hlsl", nullptr, "PS", "ps_5_0");
-	mShaders["lightingVS"] = d3dUtil::CompileShader(L"Shaders\\LightingPass.hlsl", nullptr, "VS", "vs_5_0");
-	mShaders["lightingQUADVS"] = d3dUtil::CompileShader(L"Shaders\\LightingPass.hlsl", nullptr, "VS_QUAD", "vs_5_0");
-	mShaders["lightingPS"] = d3dUtil::CompileShader(L"Shaders\\LightingPass.hlsl", nullptr, "PS", "ps_5_0");
-	mShaders["lightingPSDebug"] = d3dUtil::CompileShader(L"Shaders\\LightingPass.hlsl", nullptr, "PS_debug", "ps_5_0");
+	mShaders["lightingVS"] = d3dUtil::CompileShader(L"Shaders\\PBRLightingPass.hlsl", nullptr, "VS", "vs_5_0");
+	mShaders["lightingQUADVS"] = d3dUtil::CompileShader(L"Shaders\\PBRLightingPass.hlsl", nullptr, "VS_QUAD", "vs_5_0");
+	mShaders["lightingPS"] = d3dUtil::CompileShader(L"Shaders\\PBRLightingPass.hlsl", nullptr, "PS", "ps_5_0");
+	mShaders["lightingPSDebug"] = d3dUtil::CompileShader(L"Shaders\\PBRLightingPass.hlsl", nullptr, "PS_debug", "ps_5_0");
 	mShaders["shadowVS"] = d3dUtil::CompileShader(L"Shaders\\ShadowMap.hlsl", nullptr, "VS", "vs_5_1");
 	mShaders["postprocessVS"] = d3dUtil::CompileShader(L"Shaders\\PostProcess.hlsl", nullptr, "VS", "vs_5_0");
 	mShaders["postprocessPS"] = d3dUtil::CompileShader(L"Shaders\\PostProcess.hlsl", nullptr, "PS", "ps_5_0");
@@ -1946,7 +2108,12 @@ void TexColumnsApp::BuildCustomMeshGeometry(std::string name, UINT& meshVertexOf
 		b = b.substr(0, b.length() - 4);
 		std::cout << "NORMAL: " << b << "\n";
 
-		CreateMaterial(scene->mMaterials[k]->GetName().C_Str(), k, TexOffsets[a], TexOffsets[b], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
+		// Sponza/mesh materials: high roughness (matte), no metallic to avoid wet look
+		CreateMaterial(scene->mMaterials[k]->GetName().C_Str(), k, TexOffsets[a], TexOffsets[b],
+			XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+			XMFLOAT3(0.04f, 0.04f, 0.04f),
+			0.82f,
+			0.0f);
 	}
 
 	UINT totalMeshSize = 0;
@@ -2309,8 +2476,7 @@ void TexColumnsApp::BuildFrameResources()
 	mChromaticAberrationCB = std::make_unique<UploadBuffer<float>>(md3dDevice.Get(), 1, true);
 	mTaaCB = std::make_unique<UploadBuffer<TAAConstants>>(md3dDevice.Get(), 1, true);
 	mTaaReprojectCB = std::make_unique<UploadBuffer<TAAReprojectConstants>>(md3dDevice.Get(), 1, true);
-
-
+	mAtmosphereCB = std::make_unique<UploadBuffer<AtmosphereConstants>>(md3dDevice.Get(), 1, true);
 
 	mCurrFrameResourceIndex = 0;
 	mCurrFrameResource = mFrameResources[mCurrFrameResourceIndex].get();
@@ -2326,14 +2492,55 @@ void TexColumnsApp::BuildFrameResources()
 
 void TexColumnsApp::BuildMaterials()
 {
-	CreateMaterial("NiggaMat", 0, TexOffsets["textures/texture"], TexOffsets["textures/texture_nm"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
-	CreateMaterial("eye", 0, TexOffsets["textures/eye"], TexOffsets["textures/eye_nm"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
-	CreateMaterial("map", 0, TexOffsets["textures/HeightMap2"], TexOffsets["textures/HeightMap2"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
-	CreateMaterial("map2", 0, TexOffsets["textures/HeightMap"], TexOffsets["textures/HeightMap"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
+	CreateMaterial("NiggaMat", 0, TexOffsets["textures/texture"], TexOffsets["textures/texture_nm"],
+		XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+		XMFLOAT3(0.04f, 0.04f, 0.04f),
+		0.82f,
+		0.0f);
+	CreateMaterial("eye", 0, TexOffsets["textures/eye"], TexOffsets["textures/eye_nm"],
+		XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+		XMFLOAT3(0.05f, 0.05f, 0.05f),
+		0.7f,
+		0.0f);
+	CreateMaterial("map", 0, TexOffsets["textures/HeightMap2"], TexOffsets["textures/HeightMap2"],
+		XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+		XMFLOAT3(0.05f, 0.05f, 0.05f),
+		0.3f,
+		0.0f);
+	CreateMaterial("map2", 0, TexOffsets["textures/HeightMap"], TexOffsets["textures/HeightMap"],
+		XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f),
+		XMFLOAT3(0.05f, 0.05f, 0.05f),
+		0.3f,
+		0.0f);
 
 	// Debug material for mode 1 (moving objects).
 	CreateMaterial("MovingRed", 0, TexOffsets["textures/white1x1"], TexOffsets["textures/default_nmap"],
-		XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
+		XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f, 0.0f);
+
+	// PBR test spheres (metallic/roughness grid)
+	const int kPbrCols = 5; // metallic
+	const int kPbrRows = 5; // roughness
+	for (int r = 0; r < kPbrRows; ++r)
+	{
+		// Avoid 0 roughness (causes very sharp highlights / fireflies in LDR)
+		const float roughness = std::clamp((float)r / (float)(kPbrRows - 1), 0.04f, 1.0f);
+		for (int c = 0; c < kPbrCols; ++c)
+		{
+			const float metallic = std::clamp((float)c / (float)(kPbrCols - 1), 0.0f, 1.0f);
+
+			const std::string matName =
+				"PBR_Sphere_r" + std::to_string(r) +
+				"_c" + std::to_string(c);
+
+			CreateMaterial(matName, 0,
+				TexOffsets["textures/white1x1"],
+				TexOffsets["textures/default_nmap"],
+				XMFLOAT4(0.8f, 0.8f, 0.8f, 1.0f),
+				XMFLOAT3(0.04f, 0.04f, 0.04f),
+				roughness,
+				metallic);
+		}
+	}
 }
 void TexColumnsApp::RenderCustomMesh(std::string unique_name, std::string meshname, std::string materialName, XMFLOAT3 Scale, XMFLOAT3 Rotation, XMFLOAT3 Position)
 {
@@ -2394,6 +2601,56 @@ void TexColumnsApp::BuildRenderItems()
 	RenderCustomMesh("building", "sponza", "", XMFLOAT3(0.07, 0.07, 0.07), XMFLOAT3(0, 3.14 / 2, 0), XMFLOAT3(0, 0, 0));
 	RenderCustomMesh("nigga", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, 3.14, 0), XMFLOAT3(0, 3, 0));
 	RenderCustomMesh("nigga2", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, -3.14 / 2, 0), XMFLOAT3(-10, 3, 30));
+
+	// PBR test spheres grid (5x5: metallic across X, roughness across Z)
+	{
+		const int kPbrCols = 5;
+		const int kPbrRows = 5;
+		const float spacing = 2.2f;
+		const float startX = -0.5f * (kPbrCols - 1) * spacing;
+		const float startZ = -0.5f * (kPbrRows - 1) * spacing;
+		const float y = 120.0f; // above floor and shadows so reflections are visible
+
+		for (int r = 0; r < kPbrRows; ++r)
+		{
+			for (int c = 0; c < kPbrCols; ++c)
+			{
+				const std::string matName =
+					"PBR_Sphere_r" + std::to_string(r) +
+					"_c" + std::to_string(c);
+
+				auto sphereRitem = std::make_unique<RenderItem>();
+				sphereRitem->Name = "pbrSphere";
+
+				const float x = startX + c * spacing;
+				const float z = startZ + r * spacing;
+
+				sphereRitem->Position = { x, y, z };
+				sphereRitem->RotationAngle = { 0.0f, 0.0f, 0.0f };
+				sphereRitem->Scale = { 2.0f, 2.0f, 2.0f }; // sphere mesh radius is 0.5
+
+				sphereRitem->TranslationM = XMMatrixTranslation(x, y, z);
+				sphereRitem->RotationM = XMMatrixRotationRollPitchYaw(0.0f, 0.0f, 0.0f);
+				sphereRitem->ScaleM = XMMatrixScaling(2.0f, 2.0f, 2.0f);
+
+				XMStoreFloat4x4(&sphereRitem->TexTransform, XMMatrixIdentity());
+				XMStoreFloat4x4(&sphereRitem->World, sphereRitem->ScaleM * sphereRitem->RotationM * sphereRitem->TranslationM);
+				sphereRitem->PrevWorld = sphereRitem->World;
+
+				sphereRitem->ObjCBIndex = (UINT)mAllRitems.size();
+				sphereRitem->Mat = mMaterials[matName].get();
+				sphereRitem->BaseMat = sphereRitem->Mat;
+				sphereRitem->Geo = mGeometries["shapeGeo"].get();
+				sphereRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+				sphereRitem->IndexCount = sphereRitem->Geo->DrawArgs["sphere"].IndexCount;
+				sphereRitem->StartIndexLocation = sphereRitem->Geo->DrawArgs["sphere"].StartIndexLocation;
+				sphereRitem->BaseVertexLocation = sphereRitem->Geo->DrawArgs["sphere"].BaseVertexLocation;
+
+				mAllRitems.push_back(std::move(sphereRitem));
+			}
+		}
+	}
+
 	BuildFrameResources();
 	//RenderCustomMesh("plan", "plane2", "map", XMMatrixScaling(3, 3, 3), XMMatrixRotationRollPitchYaw(3.14, 0, 3.14), XMMatrixTranslation(0,-10,0));
 	//RenderCustomMesh("plan", "plane2", "map2", XMMatrixScaling(3, 3, 3), XMMatrixRotationRollPitchYaw(3.14, 0, 3.14), XMMatrixTranslation(0,10,0));
@@ -2619,9 +2876,54 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	mCommandList->SetGraphicsRootDescriptorTable(2, albH);
 	mCommandList->SetGraphicsRootDescriptorTable(8, velH);
 
+	auto getTexOffset = [&](const std::string& a, const std::string& b, const std::string& fallback) -> int
+		{
+			auto it = TexOffsets.find(a);
+			if (it != TexOffsets.end()) return it->second;
+			it = TexOffsets.find(b);
+			if (it != TexOffsets.end()) return it->second;
+			it = TexOffsets.find(fallback);
+			if (it != TexOffsets.end()) return it->second;
+			return -1;
+		};
+
+	const int irrIdx = getTexOffset("irradiance", "textures/irradiance", "textures/sunsetcube1024");
+	const int preIdx = getTexOffset("prefiltered", "textures/prefiltered", "textures/sunsetcube1024");
+	const int brdfIdx = getTexOffset("brdfLUT", "textures/brdfLUT", "textures/white1x1");
+	const int skyIdx = getTexOffset("skybox", "textures/skybox", "textures/sunsetcube1024");
+
+	if (irrIdx >= 0)
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		h.Offset(irrIdx, mCbvSrvDescriptorSize);
+		mCommandList->SetGraphicsRootDescriptorTable(10, h);
+	}
+	if (preIdx >= 0)
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		h.Offset(preIdx, mCbvSrvDescriptorSize);
+		mCommandList->SetGraphicsRootDescriptorTable(11, h);
+	}
+	if (brdfIdx >= 0)
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		h.Offset(brdfIdx, mCbvSrvDescriptorSize);
+		mCommandList->SetGraphicsRootDescriptorTable(12, h);
+	}
+	if (skyIdx >= 0)
+	{
+		CD3DX12_GPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		h.Offset(skyIdx, mCbvSrvDescriptorSize);
+		mCommandList->SetGraphicsRootDescriptorTable(13, h);
+	}
+
 	// b3 debug constants (mode)
 	UINT debugConsts[4] = { (UINT)gVelocityDebugMode, 0, 0, 0 };
 	mCommandList->SetGraphicsRoot32BitConstants(9, 4, debugConsts, 0);
+
+	// b4 atmosphere (sun + rayleigh/mie/turbidity)
+	if (mAtmosphereCB != nullptr)
+		mCommandList->SetGraphicsRootConstantBufferView(14, mAtmosphereCB->Resource()->GetGPUVirtualAddress());
 
 	// b0 pass
 	mCommandList->SetGraphicsRootConstantBufferView(3, passCB->GetGPUVirtualAddress());

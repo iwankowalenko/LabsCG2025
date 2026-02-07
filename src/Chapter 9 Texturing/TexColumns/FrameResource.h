@@ -55,6 +55,8 @@ struct PassShadowConstants
     DirectX::XMFLOAT4X4 LightViewProj = MathHelper::Identity4x4();
 };
 
+// AtmosphereConstants is defined in ../../Common/d3dUtil.h (included above)
+
 struct Vertex
 {
     DirectX::XMFLOAT3 Pos;
