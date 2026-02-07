@@ -215,39 +215,60 @@ float3 SeamlessCubeLookup(float3 v, float cubeFaceSize)
     return normalize(v);
 }
 
-// Artist-friendly atmosphere: Rayleigh/Mie/Turbidity in 0..1 range, output in 0..1
+// Artist-friendly atmosphere: Rayleigh/Mie/Turbidity, optical path, sunset colors
 float RayleighPhase(float cosTheta) { return 3.0f / (16.0f * PI) * (1.0f + cosTheta * cosTheta); }
 float MiePhase(float cosTheta, float g) { float g2 = g * g; float denom = 1.0f + g2 - 2.0f * g * cosTheta; return (1.0f - g2) / (4.0f * PI * pow(max(denom, 1e-6f), 1.5f)); }
 
+// Optical path: when sun is low, light travels through more atmosphere -> longer path -> more red
+// sunElevation = sunDir.y (1 = zenith, 0 = horizon). Air mass ~ 1/sin(elevation).
+void GetOpticalPathAndSunsetFactor(float3 sunDir, out float opticalPathNorm, out float sunsetFactor)
+{
+    float sunElevation = max(sunDir.y, 0.02f); // avoid div by zero
+    float airMass = 1.0f / sunElevation;       // long path when sun low
+    opticalPathNorm = saturate((airMass - 1.0f) / 15.0f);  // 0 at zenith, ~1 when sun near horizon
+    sunsetFactor = 1.0f - exp(-opticalPathNorm * 2.0f);    // smooth 0..1 for sunset tint
+}
+
 float3 ComputeAtmosphereSky(float3 viewDir, float3 sunDir)
 {
+    float opticalPathNorm, sunsetFactor;
+    GetOpticalPathAndSunsetFactor(sunDir, opticalPathNorm, sunsetFactor);
+
     float sunCos = saturate(dot(viewDir, sunDir));
-    // Height factor: 0 = horizon, 1 = zenith
     float height = saturate(viewDir.y * 0.5f + 0.5f);
     float horizon = 1.0f - height;
 
-    // Base gradient: blue zenith, lighter/warmer horizon
+    // Horizon band: stronger near view horizon (viewDir.y small)
+    float horizonBand = saturate(1.0f - viewDir.y * 2.0f);
+
+    // Base gradient: blue zenith, warmer horizon; shift horizon to yellow/red when sun is low
     float3 zenithColor = float3(0.25f, 0.5f, 0.95f);
-    float3 horizonColor = float3(0.7f, 0.8f, 0.95f);
+    float3 horizonColorDay = float3(0.7f, 0.8f, 0.95f);
+    float3 horizonColorSunset = float3(1.0f, 0.55f, 0.2f);   // orange-red near horizon at sunset
+    float3 horizonColor = lerp(horizonColorDay, horizonColorSunset, sunsetFactor * horizonBand);
     float3 skyGradient = lerp(horizonColor, zenithColor, height);
 
-    // Rayleigh: blue scattering (clean sky)
+    // Rayleigh: blue scattered more when path is short; long path removes blue (red remains)
     float phaseR = RayleighPhase(sunCos);
     float rayleighAmount = gRayleigh * (1.0f + 0.3f * horizon);
     float3 rayleighTint = float3(0.3f, 0.5f, 1.0f);
-    float3 rayleighContribution = rayleighTint * phaseR * rayleighAmount;
+    float rayleighPathAtten = 1.0f - opticalPathNorm * 0.7f; // less blue when path long
+    float3 rayleighContribution = rayleighTint * phaseR * rayleighAmount * max(rayleighPathAtten, 0.2f);
 
-    // Mie: haze + sun halo. Turbidity strongly scales haze (1=clear, 2=noticeably hazy, 3+=dirty)
+    // Mie: haze + sun halo; longer path = more orange halo
     float phaseM = MiePhase(sunCos, -0.76f);
-    float turbidityScale = 0.4f + 0.6f * gTurbidity; // 1 -> 1.0, 2 -> 1.6, 3 -> 2.2
-    float mieAmount = gMie * turbidityScale * (0.6f + 0.4f * horizon);
-    float3 mieHaze = float3(0.85f, 0.85f, 0.9f); // gray haze
+    float turbidityScale = 0.4f + 0.6f * gTurbidity;
+    float mieAmount = gMie * turbidityScale * (0.6f + 0.4f * horizon) * (1.0f + 0.5f * opticalPathNorm);
+    float3 mieHaze = float3(0.85f, 0.85f, 0.9f);
     float3 mieContribution = mieHaze * phaseM * mieAmount;
-    // Sun glow halo (visible when looking near sun + high Mie/Turbidity)
     float sunGlow = pow(sunCos, 4.0f) * gMie * gTurbidity * 2.0f;
-    float3 mieSunHalo = float3(1.0f, 0.98f, 0.9f) * sunGlow;
+    float3 mieSunHaloColor = lerp(float3(1.0f, 0.98f, 0.9f), float3(1.0f, 0.7f, 0.4f), sunsetFactor);
+    float3 mieSunHalo = mieSunHaloColor * sunGlow;
 
-    // Desaturate sky with haze (Turbidity + Mie = "dirty" look)
+    // Extra sunset glow along horizon band when sun is low
+    float3 sunsetGlow = float3(1.0f, 0.5f, 0.15f) * sunsetFactor * horizonBand * (0.3f + 0.4f * sunCos);
+    skyGradient += sunsetGlow;
+
     float hazeBlend = saturate((gMie * 0.5f + (gTurbidity - 1.0f) * 0.3f));
     float3 hazeGray = float3(0.6f, 0.65f, 0.75f);
     float3 skyWithScatter = skyGradient + rayleighContribution + mieContribution + mieSunHalo;
@@ -261,7 +282,14 @@ float3 ComputeSunDisc(float3 viewDir, float3 sunDir, float radius, float intensi
 {
     float cosAngle = dot(viewDir, sunDir);
     float disc = smoothstep(radius - 0.002f, radius, cosAngle);
-    return float3(intensity, intensity, intensity) * disc;
+
+    float opticalPathNorm, sunsetFactor;
+    GetOpticalPathAndSunsetFactor(sunDir, opticalPathNorm, sunsetFactor);
+    // Sun color: white at zenith, yellow-orange-red near horizon (long optical path)
+    float3 sunColorDay = float3(1.0f, 1.0f, 1.0f);
+    float3 sunColorSunset = float3(1.0f, 0.6f, 0.2f);
+    float3 sunColor = lerp(sunColorDay, sunColorSunset, sunsetFactor);
+    return sunColor * intensity * disc;
 }
 
 float ComputeShadowFactor(float3 posW)

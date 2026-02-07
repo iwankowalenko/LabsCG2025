@@ -276,6 +276,9 @@ private:
 	std::unique_ptr<UploadBuffer<AtmosphereConstants>> mAtmosphereCB = nullptr;
 	AtmosphereConstants mAtmosphereParams;
 
+	bool mDayNightCycleEnabled = false;
+	float mDayNightCycleDuration = 7.0f; // day timing
+
 	Microsoft::WRL::ComPtr<ID3D12Resource> mTaaDepthHistory[2];
 	CD3DX12_GPU_DESCRIPTOR_HANDLE mTaaDepthHistorySrv[2];
 
@@ -858,9 +861,30 @@ void TexColumnsApp::UpdateObjectCBs(const GameTimer& gt)
 
 void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 {
-
 	auto currLightCB = mCurrFrameResource->LightCB.get();
 	auto currShadowCB = mCurrFrameResource->PassShadowCB.get();
+
+	// Day/Night cycle: animate first directional light (sun) when enabled
+	if (mDayNightCycleEnabled && mDayNightCycleDuration > 0.01f)
+	{
+		const float twoPi = 6.283185307f;
+		float angle = (float)fmod(gt.TotalTime() * twoPi / mDayNightCycleDuration, twoPi);
+		// Sun path: angle 0 = east (rise), PI/2 = noon (up), PI = west (set), 3*PI/2 = night (below)
+		float sunY = sinf(angle);  // elevation: 0 at horizon, 1 at zenith
+		float sunX = cosf(angle);   // east-west
+		XMFLOAT3 towardSun = { sunX, sunY, 0.0f };
+		XMVECTOR v = XMLoadFloat3(&towardSun);
+		v = XMVector3Normalize(v);
+		XMFLOAT3 lightDir;
+		XMStoreFloat3(&lightDir, -v); // light direction = from sun to scene
+
+		for (auto& l : mLights)
+			if (l.type == 2) {
+				l.Direction = lightDir;
+				break;
+			}
+	}
+
 	int lId = 0;
 	for (auto& l : mLights)
 	{
@@ -1023,6 +1047,9 @@ void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 	// Atmosphere: real-time params (clean vs dirty)
 	ImGui::Separator();
 	ImGui::Text("Atmosphere (sky)");
+	ImGui::Checkbox("Day/Night cycle (animate sun)", &mDayNightCycleEnabled);
+	if (mDayNightCycleEnabled)
+		ImGui::DragFloat("Day length (sec)", &mDayNightCycleDuration, 1.0f, 5.0f, 300.0f);
 	ImGui::DragFloat("Rayleigh (0..1, blue/clean sky)", &mAtmosphereParams.Rayleigh, 0.02f, 0.0f, 2.0f);
 	ImGui::DragFloat("Mie (0..1, haze)", &mAtmosphereParams.Mie, 0.02f, 0.0f, 1.0f);
 	ImGui::DragFloat("Turbidity (1=clear, 2+=dirty)", &mAtmosphereParams.Turbidity, 0.05f, 0.5f, 5.0f);

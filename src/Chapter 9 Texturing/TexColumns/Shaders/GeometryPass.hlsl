@@ -109,13 +109,13 @@ VertexOut VS(VertexIn vin)
 
 
 
-// PSOutput с несколькими буферами
+// PSOutput пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ
 struct PSOutput
 {
     float4 Albedo : SV_Target0; // Diffuse color
-    float4 Normal : SV_Target1; // Normal.xyz, alpha можно задать =1
+    float4 Normal : SV_Target1; // Normal.xyz, alpha пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ =1
     float4 Position : SV_Target2; // Position.xyz, alpha=1
-    float2 Velocity : SV_Target3; // формат R16G16_FLOAT
+    float2 Velocity : SV_Target3; // пїЅпїЅпїЅпїЅпїЅпїЅ R16G16_FLOAT
 };
 
 float3 NormalSampleToWorldSpace(float3 normalMapSample, float3 unitNormalW, float3 tangentW)
