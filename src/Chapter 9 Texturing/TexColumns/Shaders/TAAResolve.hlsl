@@ -39,7 +39,6 @@ VSOut VS(uint vid : SV_VertexID)
     float2 p = positions[vid];
     o.PosH = float4(p, 0.0f, 1.0f);
 
-
     o.UV = float2((o.PosH.x + 1.0f) * 0.5f, (1.0f - o.PosH.y) * 0.5f);
 
     return o;

@@ -1,4 +1,4 @@
-﻿//***************************************************************************************
+//***************************************************************************************
 // TexColumnsApp.cpp by Frank Luna (C) 2015 All Rights Reserved.
 //***************************************************************************************
 #include "../../Common/Camera.h"
@@ -10,6 +10,7 @@
 #include "FrameResource.h"
 #include <iostream>
 #include <algorithm> 
+#include <cmath>
 
 
 #include "imgui_impl_dx12.h"
@@ -18,6 +19,9 @@
 Camera cam;
 static int imguiID = 0;
 static bool CCenabled = false;
+static bool enableMovement = false;
+// 0 = Off, 1 = Moving objects (CPU/world delta), 2 = Velocity buffer (camera+objects), 3 = Velocity buffer object-only (approx)
+static int gVelocityDebugMode = 0;
 using Microsoft::WRL::ComPtr;
 using namespace DirectX;
 using namespace DirectX::PackedVector;
@@ -57,6 +61,7 @@ struct RenderItem
 	UINT ObjCBIndex = -1;
 
 	Material* Mat = nullptr;
+	Material* BaseMat = nullptr; // Original material (restore after debug overrides)
 	MeshGeometry* Geo = nullptr;
 
 	// Primitive topology.
@@ -544,6 +549,29 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	ImGui::NewFrame();
 	ImGui::Begin("Settings");
 	ImGui::Text("Objects\n\n");
+
+	// Velocity debug visualization modes
+	ImGui::Combo("Velocity debug mode", &gVelocityDebugMode,
+		"Off\0Moving objects (no camera)\0Velocity buffer (camera+objects)\0Velocity buffer object-only (approx)\0\0");
+
+	Material* movingRedMat = nullptr;
+	if (auto it = mMaterials.find("MovingRed"); it != mMaterials.end())
+	{
+		movingRedMat = it->second.get();
+	}
+	constexpr float kWorldDiffEps = 1e-4f;
+	auto worldChanged = [&](const XMFLOAT4X4& a, const XMFLOAT4X4& b) -> bool
+		{
+			const float* pa = reinterpret_cast<const float*>(&a);
+			const float* pb = reinterpret_cast<const float*>(&b);
+			for (int i = 0; i < 16; ++i)
+			{
+				if (std::fabs(pa[i] - pb[i]) > kWorldDiffEps)
+					return true;
+			}
+			return false;
+		};
+
 	for (auto& rItem : mAllRitems)
 	{
 		rItem->PrevWorld = rItem->World;
@@ -557,12 +585,43 @@ void TexColumnsApp::Update(const GameTimer& gt)
 
 			ImGui::DragFloat3("Scale", (float*)&rItem->Scale, 0.05f);
 
+			if (rItem->Name == "nigga")
+			{
+				ImGui::Checkbox("Enable Movement", &enableMovement);
+			}
+
 			ImGui::PopID();
+
+			// Circular movement logic for "nigga" object
+			if (rItem->Name == "nigga" && enableMovement)
+			{
+				float radius = 5.0f;
+				float speed = 2.0f;
+				float angle = gt.TotalTime() * speed;
+				rItem->Position.x = std::cos(angle) * radius;
+				rItem->Position.z = std::sin(angle) * radius;
+			}
+
 			rItem->TranslationM = XMMatrixTranslation(rItem->Position.x, rItem->Position.y, rItem->Position.z);
 			rItem->RotationM = XMMatrixRotationRollPitchYaw(rItem->RotationAngle.x, rItem->RotationAngle.y, rItem->RotationAngle.z);
 			rItem->ScaleM = XMMatrixScaling(rItem->Scale.x, rItem->Scale.y, rItem->Scale.z);
 			XMStoreFloat4x4(&rItem->World, rItem->ScaleM * rItem->RotationM * rItem->TranslationM);
 			rItem->NumFramesDirty = gNumFrameResources;
+		}
+
+		// Mode 1: paint only moving objects (ignores camera motion).
+		// Other modes: restore original material (velocity-based modes are handled in lighting shader).
+		if (rItem->BaseMat == nullptr)
+			rItem->BaseMat = rItem->Mat;
+
+		if (gVelocityDebugMode == 1 && movingRedMat != nullptr)
+		{
+			const bool isMovingObj = worldChanged(rItem->PrevWorld, rItem->World);
+			rItem->Mat = isMovingObj ? movingRedMat : rItem->BaseMat;
+		}
+		else
+		{
+			rItem->Mat = rItem->BaseMat;
 		}
 	}
 	ImGui::Text("\n\nLights\n\n");
@@ -580,9 +639,9 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	mChromaticAberrationCB->CopyData(0, gChromaticAberrationOffset);
 
 	ImGui::Begin("TAA");
-	ImGui::DragFloat("Strength", &mTaaStrength, 0.01f, 0.0f, 1.0f);
+	//ImGui::DragFloat("Strength", &mTaaStrength, 0.01f, 0.0f, 1.0f);
 	ImGui::DragFloat("Alpha", &mTaaAlpha, 0.001f, 0.0f, 1.0f);
-	ImGui::DragFloat("ClampExpand", &mTaaClampExpand, 0.001f, 0.0f, 1.0f);
+	//ImGui::DragFloat("ClampExpand", &mTaaClampExpand, 0.001f, 0.0f, 1.0f);
 	ImGui::End();
 
 	TAAConstants c = {};
@@ -994,7 +1053,7 @@ void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 	// UV jitter (то, что надо вычитать в velocity)
 	XMFLOAT2 currJitterUV;
 	currJitterUV.x = jitterNdcX * 0.5f;
-	currJitterUV.y = -jitterNdcY * 0.5f; // важно: UV y вниз
+	currJitterUV.y = -jitterNdcY * 0.5f; //UV y вниз
 
 	// Jittered projection -> ViewProj (для растеризации/рендера)
 	XMMATRIX jitterT = XMMatrixTranslation(jitterNdcX, jitterNdcY, 0.0f);
@@ -1248,7 +1307,7 @@ void TexColumnsApp::BuildRootSignature()
 
 void TexColumnsApp::BuildLightingRootSignature()
 {
-	// t0 = Albedo, t1 = Normal, t2 = Position, t3 = ShadowMap, t4 = ShadowTexture
+	// t0 = Position, t1 = Normal, t2 = Albedo, t3 = ShadowMap, t4 = ShadowTexture, t5 = Velocity
 
 	CD3DX12_DESCRIPTOR_RANGE rAlbedo;
 	rAlbedo.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0
@@ -1265,7 +1324,10 @@ void TexColumnsApp::BuildLightingRootSignature()
 	CD3DX12_DESCRIPTOR_RANGE rShadowTex;
 	rShadowTex.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4); // t4
 
-	CD3DX12_ROOT_PARAMETER rootParams[8];
+	CD3DX12_DESCRIPTOR_RANGE rVelocity;
+	rVelocity.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5
+
+	CD3DX12_ROOT_PARAMETER rootParams[10];
 	rootParams[0].InitAsDescriptorTable(1, &rAlbedo, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParams[1].InitAsDescriptorTable(1, &rNormal, D3D12_SHADER_VISIBILITY_PIXEL);
 	rootParams[2].InitAsDescriptorTable(1, &rPosition, D3D12_SHADER_VISIBILITY_PIXEL);
@@ -1276,6 +1338,9 @@ void TexColumnsApp::BuildLightingRootSignature()
 
 	rootParams[6].InitAsDescriptorTable(1, &rShadowMap, D3D12_SHADER_VISIBILITY_PIXEL); // t3
 	rootParams[7].InitAsDescriptorTable(1, &rShadowTex, D3D12_SHADER_VISIBILITY_PIXEL); // t4
+	rootParams[8].InitAsDescriptorTable(1, &rVelocity, D3D12_SHADER_VISIBILITY_PIXEL);  // t5
+	// b3: debug constants (root constants)
+	rootParams[9].InitAsConstants(4, 3, 0, D3D12_SHADER_VISIBILITY_PIXEL);
 
 	auto staticSamplers = GetStaticSamplers();
 
@@ -2265,6 +2330,10 @@ void TexColumnsApp::BuildMaterials()
 	CreateMaterial("eye", 0, TexOffsets["textures/eye"], TexOffsets["textures/eye_nm"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
 	CreateMaterial("map", 0, TexOffsets["textures/HeightMap2"], TexOffsets["textures/HeightMap2"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
 	CreateMaterial("map2", 0, TexOffsets["textures/HeightMap"], TexOffsets["textures/HeightMap"], XMFLOAT4(1.0f, 1.0f, 1.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
+
+	// Debug material for mode 1 (moving objects).
+	CreateMaterial("MovingRed", 0, TexOffsets["textures/white1x1"], TexOffsets["textures/default_nmap"],
+		XMFLOAT4(1.0f, 0.0f, 0.0f, 1.0f), XMFLOAT3(0.05f, 0.05f, 0.05f), 0.3f);
 }
 void TexColumnsApp::RenderCustomMesh(std::string unique_name, std::string meshname, std::string materialName, XMFLOAT3 Scale, XMFLOAT3 Rotation, XMFLOAT3 Position)
 {
@@ -2294,6 +2363,7 @@ void TexColumnsApp::RenderCustomMesh(std::string unique_name, std::string meshna
 		std::cout << unique_name << " " << matname << "\n";
 		if (materialName != "") matname = materialName;
 		rItem->Mat = mMaterials[matname].get();
+		rItem->BaseMat = rItem->Mat;
 		rItem->IndexCount = rItem->Geo->MultiDrawArgs[meshname][i].second.IndexCount;
 		rItem->StartIndexLocation = rItem->Geo->MultiDrawArgs[meshname][i].second.StartIndexLocation;
 		rItem->BaseVertexLocation = rItem->Geo->MultiDrawArgs[meshname][i].second.BaseVertexLocation;
@@ -2313,6 +2383,7 @@ void TexColumnsApp::BuildRenderItems()
 	XMStoreFloat4x4(&boxRitem->TexTransform, XMMatrixScaling(1, 1, 1));
 	boxRitem->ObjCBIndex = 0;
 	boxRitem->Mat = mMaterials["NiggaMat"].get();
+	boxRitem->BaseMat = boxRitem->Mat;
 	boxRitem->Geo = mGeometries["shapeGeo"].get();
 	boxRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 	boxRitem->IndexCount = boxRitem->Geo->DrawArgs["box"].IndexCount;
@@ -2540,9 +2611,17 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	CD3DX12_GPU_DESCRIPTOR_HANDLE albH(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
 	albH.Offset(mGBufferSrvIndexAlbedo, mCbvSrvDescriptorSize);
 
+	CD3DX12_GPU_DESCRIPTOR_HANDLE velH(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+	velH.Offset(mGBufferSrvIndexVelocity, mCbvSrvDescriptorSize);
+
 	mCommandList->SetGraphicsRootDescriptorTable(0, posH);
 	mCommandList->SetGraphicsRootDescriptorTable(1, nrmH);
 	mCommandList->SetGraphicsRootDescriptorTable(2, albH);
+	mCommandList->SetGraphicsRootDescriptorTable(8, velH);
+
+	// b3 debug constants (mode)
+	UINT debugConsts[4] = { (UINT)gVelocityDebugMode, 0, 0, 0 };
+	mCommandList->SetGraphicsRoot32BitConstants(9, 4, debugConsts, 0);
 
 	// b0 pass
 	mCommandList->SetGraphicsRootConstantBufferView(3, passCB->GetGPUVirtualAddress());

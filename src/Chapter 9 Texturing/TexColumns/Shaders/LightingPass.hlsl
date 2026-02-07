@@ -7,6 +7,7 @@ Texture2D gNormalMap : register(t1);
 Texture2D gAlbedoMap : register(t2);
 Texture2D gShadowMap : register(t3);
 Texture2D gShadowTexture : register(t4);
+Texture2D<float2> gVelocityMap : register(t5);
 SamplerState gsamPointWrap : register(s0);
 SamplerState gsamPointClamp : register(s1);
 SamplerState gsamLinearWrap : register(s2);
@@ -35,11 +36,25 @@ cbuffer cbPass : register(b0)
     float gDeltaTime;
     float4 gAmbientLight;
 
+    // TAA / velocity-related matrices (match PassConstants layout)
+    float4x4 gViewProjNoJitter;
+    float4x4 gPrevViewProjNoJitter;
+    float4x4 gPrevViewProj;
+    float2 gCurrJitterUV;
+    float2 gPrevJitterUV;
+    float2 _padTaa;
+
     // Indices [0, NUM_DIR_LIGHTS) are directional lights;
     // indices [NUM_DIR_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHTS) are point lights;
     // indices [NUM_DIR_LIGHTS+NUM_POINT_LIGHTS, NUM_DIR_LIGHTS+NUM_POINT_LIGHT+NUM_SPOT_LIGHTS)
     // are spot lights for a maximum of MaxLights per object.
     Light gLights[MaxLights];
+};
+
+cbuffer cbDebug : register(b3)
+{
+    uint gVelocityDebugMode; // 0=Off, 1=Moving objects, 2=Velocity buffer, 3=Velocity buffer object-only (approx)
+    float3 _padDebug;
 };
 cbuffer cbPerObject : register(b1)
 {
@@ -52,7 +67,7 @@ cbuffer cbLight : register(b2)
 {
     Light light;
 }
-// Вершинный шейдер для полноэкранного треугольника
+// ????????? ?????? ??? ?????????????? ????????????
 struct VSOut
 {
     float4 PosH : SV_POSITION;
@@ -63,7 +78,7 @@ VSOut VS_QUAD(uint vid : SV_VertexID)
 {
     VSOut output;
     
-    // Координаты вершин полноэкранного треугольника
+    // ?????????? ?????? ?????????????? ????????????
     float2 positions[3] =
     {
         float2(-1, -1),
@@ -103,16 +118,49 @@ VSOut VS(VertexIn vin)
     return vout;
 }
 
-// Пиксельный шейдер освещения
+// ?????????? ?????? ?????????
 float4 PS(VSOut pin) : SV_TARGET
 {
     float2 texelSize = 1.0f / float2(2048, 2048); // Pass these as constants
     
     int2 pix = int2(pin.PosH.xy);
-    // Вычитываем G-Buffer
+    // ?????????? G-Buffer
     float4 albedo = gAlbedoMap.Load(int3(pix, 0));
     float3 normalW = normalize(gNormalMap.Load(int3(pix, 0)).xyz);
     float3 posW = gPositionMap.Load(int3(pix, 0)).xyz;
+
+    // Debug: paint pixels using velocity buffer.
+    // Mode 2: full velocity (camera + objects).
+    // Mode 3: object-only velocity (approx) by subtracting camera-induced velocity.
+    if (gVelocityDebugMode == 2 || gVelocityDebugMode == 3)
+    {
+        float2 fullVelUV = gVelocityMap.Load(int3(pix, 0));
+        float2 velUV = fullVelUV;
+
+        if (gVelocityDebugMode == 3)
+        {
+            // Camera-only velocity for a static world point at posW:
+            // project posW with current and previous (no-jitter) view-projection.
+            float4 currClip = mul(float4(posW, 1.0f), gViewProjNoJitter);
+            float4 prevClip = mul(float4(posW, 1.0f), gPrevViewProjNoJitter);
+
+            float invWc = (abs(currClip.w) > 1e-6f) ? (1.0f / currClip.w) : 0.0f;
+            float invWp = (abs(prevClip.w) > 1e-6f) ? (1.0f / prevClip.w) : 0.0f;
+
+            float2 currNdc = currClip.xy * invWc;
+            float2 prevNdc = prevClip.xy * invWp;
+            float2 camVelNdc = prevNdc - currNdc;
+            float2 camVelUV = camVelNdc * float2(0.5f, -0.5f);
+
+            velUV = fullVelUV - camVelUV;
+        }
+
+        // "Non-zero velocity" with a small epsilon to avoid noise.
+        if (dot(velUV, velUV) > 1e-10f)
+        {
+            albedo.rgb = float3(1.0f, 0.0f, 0.0f);
+        }
+    }
 
     float3 toEyeW = normalize(gEyePosW - posW);
 
@@ -162,7 +210,7 @@ float4 PS(VSOut pin) : SV_TARGET
     }
     
     // shadow pattern
-    //float2 uv = pin.TexC * 5; // повторяем текстуру, увеличь/уменьши как хочешь
+    //float2 uv = pin.TexC * 5; // ????????? ????????, ???????/??????? ??? ??????
     //float4 pattern = gShadowTexture.Sample(gsamAnisotropicWrap, uv);
     //shadowFactor += pattern.r*0.1;
     //shadowFactor = saturate(shadowFactor);
