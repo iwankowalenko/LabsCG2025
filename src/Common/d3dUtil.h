@@ -230,7 +230,8 @@ struct Light
     // --- New Shadow Properties ---
     DirectX::XMFLOAT4X4 LightViewProj = MathHelper::Identity4x4();
     int enablePCF = 0;
-    int pcf_level = 1.0;
+    int pcf_level = 1;
+    float ShadowSoftness = 4.0f;  /* radius in shadow texels for soft cone; 0 = hard; required for PBRLightingPass */
     DirectX::XMFLOAT4X4 LightView = MathHelper::Identity4x4();
     DirectX::XMFLOAT4X4 LightProj = MathHelper::Identity4x4();
     // Store the combined LightView * LightProj matrix for sending to shaders

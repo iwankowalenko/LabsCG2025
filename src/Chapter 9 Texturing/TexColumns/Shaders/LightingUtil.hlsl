@@ -24,6 +24,7 @@ struct Light
     // uint ShadowMapIndex;
     int enablePCF;
     int pcf_level;
+    float ShadowSoftness;  // radius in shadow texels (soft cone); 0 = hard
 };
 
 struct Material

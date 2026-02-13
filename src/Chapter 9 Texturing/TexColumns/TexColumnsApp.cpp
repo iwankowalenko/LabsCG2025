@@ -9,10 +9,12 @@
 #include "../../Common/GeometryGenerator.h"
 #include <filesystem>
 #include "FrameResource.h"
+#include "Terrain.h"
 #include <iostream>
 #include <algorithm> 
 #include <cmath>
 #include <cctype>
+#include <dxcapi.h>
 
 
 #include "imgui_impl_dx12.h"
@@ -30,6 +32,92 @@ using namespace DirectX::PackedVector;
 
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "D3D12.lib")
+// Note: we load DXC (dxcompiler.dll) dynamically at runtime for DXR shaders.
+
+static ComPtr<ID3DBlob> CompileShaderDXC(
+	const std::wstring& filename,
+	const std::wstring& entrypoint,
+	const std::wstring& target,
+	const std::vector<LPCWSTR>& extraArgs = {})
+{
+	// Dynamically load DXC so the app can still run without it (falls back to shadow maps).
+	using DxcCreateInstanceProc = HRESULT(WINAPI*)(REFCLSID, REFIID, LPVOID*);
+	static HMODULE sDxcompiler = nullptr;
+	static DxcCreateInstanceProc sDxcCreateInstance = nullptr;
+
+	if (!sDxcCreateInstance)
+	{
+		sDxcompiler = LoadLibraryW(L"dxcompiler.dll");
+		if (!sDxcompiler)
+			ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
+
+		sDxcCreateInstance = (DxcCreateInstanceProc)GetProcAddress(sDxcompiler, "DxcCreateInstance");
+		if (!sDxcCreateInstance)
+			ThrowIfFailed(E_FAIL);
+	}
+
+	// Avoid linking against CLSID_* globals (which would reintroduce dxcompiler.lib dependency).
+	static const CLSID CLSID_DxcUtilsLocal =
+	{ 0x6245d6af, 0x66e0, 0x48fd, { 0x80, 0xb4, 0x4d, 0x27, 0x17, 0x96, 0x74, 0x8c } };
+	static const CLSID CLSID_DxcCompilerLocal =
+	{ 0x73e22d93, 0xe6ce, 0x47f3, { 0xb5, 0xbf, 0xf0, 0x66, 0x4f, 0x39, 0xc1, 0xb0 } };
+
+	ComPtr<IDxcUtils> utils;
+	ComPtr<IDxcCompiler3> compiler;
+	ThrowIfFailed(sDxcCreateInstance(CLSID_DxcUtilsLocal, IID_PPV_ARGS(&utils)));
+	ThrowIfFailed(sDxcCreateInstance(CLSID_DxcCompilerLocal, IID_PPV_ARGS(&compiler)));
+
+	ComPtr<IDxcIncludeHandler> includeHandler;
+	ThrowIfFailed(utils->CreateDefaultIncludeHandler(&includeHandler));
+
+	uint32_t codePage = DXC_CP_UTF8;
+	ComPtr<IDxcBlobEncoding> source;
+	ThrowIfFailed(utils->LoadFile(filename.c_str(), &codePage, &source));
+
+	DxcBuffer srcBuf = {};
+	srcBuf.Ptr = source->GetBufferPointer();
+	srcBuf.Size = source->GetBufferSize();
+	srcBuf.Encoding = DXC_CP_UTF8;
+
+	std::vector<LPCWSTR> args;
+	args.reserve(16 + extraArgs.size());
+	args.push_back(filename.c_str());
+	args.push_back(L"-E"); args.push_back(entrypoint.c_str());
+	args.push_back(L"-T"); args.push_back(target.c_str());
+#if defined(DEBUG) || defined(_DEBUG)
+	args.push_back(L"-Zi");
+	args.push_back(L"-Qembed_debug");
+	args.push_back(L"-Od");
+#else
+	args.push_back(L"-O3");
+#endif
+	// HLSL uses column-major by default; keep consistent with existing shaders.
+	// Add shader folder for includes.
+	args.push_back(L"-I"); args.push_back(L"Shaders");
+
+	for (auto a : extraArgs) args.push_back(a);
+
+	ComPtr<IDxcResult> result;
+	ThrowIfFailed(compiler->Compile(&srcBuf, args.data(), (uint32_t)args.size(),
+		includeHandler.Get(), IID_PPV_ARGS(&result)));
+
+	ComPtr<IDxcBlobUtf8> errors;
+	ThrowIfFailed(result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr));
+	if (errors && errors->GetStringLength() > 0)
+		OutputDebugStringA(errors->GetStringPointer());
+
+	HRESULT status = S_OK;
+	ThrowIfFailed(result->GetStatus(&status));
+	ThrowIfFailed(status);
+
+	ComPtr<IDxcBlob> dxil;
+	ThrowIfFailed(result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&dxil), nullptr));
+
+	ComPtr<ID3DBlob> byteCode;
+	ThrowIfFailed(D3DCreateBlob(dxil->GetBufferSize(), byteCode.GetAddressOf()));
+	memcpy(byteCode->GetBufferPointer(), dxil->GetBufferPointer(), dxil->GetBufferSize());
+	return byteCode;
+}
 
 const int gNumFrameResources = 3;
 
@@ -161,6 +249,16 @@ private:
 	void CreateSpotLight(XMFLOAT3 pos, XMFLOAT3 rot, XMFLOAT3 color, float faloff_start, float faloff_end, float strength, float spotpower);
 	void CreatePointLight(XMFLOAT3 pos, XMFLOAT3 color, float faloff_start, float faloff_end, float strength);
 
+	void LoadTerrainTextures();
+	void BuildTerrainGeometry();
+	void DrawTerrain(ID3D12GraphicsCommandList* cmdList);
+	void BuildDxrShadowRootSignature();
+	void BuildDxrShadowPSO();
+	void BuildDxrAccelerationStructures();
+	void CreateDxrShadowMaskResources();
+	void CreateDxrShadowDescriptors();
+	void DispatchDxrShadowMask(ID3D12GraphicsCommandList* cmdList);
+
 private:
 	std::unordered_map<std::string, unsigned int>ObjectsMeshCount;
 	std::vector<std::unique_ptr<FrameResource>> mFrameResources;
@@ -177,6 +275,7 @@ private:
 
 	ComPtr<ID3D12DescriptorHeap> mSrvDescriptorHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> m_ImGuiSrvDescriptorHeap; // Member variable
+	bool mImGuiInitialized = false;
 
 	std::unordered_map<std::string, std::unique_ptr<MeshGeometry>> mGeometries;
 	std::unordered_map<std::string, std::unique_ptr<Material>> mMaterials;
@@ -275,6 +374,72 @@ private:
 
 	std::unique_ptr<UploadBuffer<AtmosphereConstants>> mAtmosphereCB = nullptr;
 	AtmosphereConstants mAtmosphereParams;
+
+	std::unique_ptr<Terrain> mTerrain;
+	std::vector<int> mTerrainHeightmapIndicesLOD0;
+	std::vector<int> mTerrainHeightmapIndicesLOD1;
+	std::vector<int> mTerrainHeightmapIndicesLOD2;
+	int mTerrainMaterialIndex = -1;
+	float mTerrainHeightScale = 50.0f;
+	float mTerrainWorldSize = 100.0f;
+	float mTerrainLOD1Factor = 0.6f;
+	float mTerrainLOD2Factor = 0.3f;
+	int mTerrainFallbackHeightmapIndex = -1;
+	bool mTerrainEnabled = true;
+	bool mTerrainWireframe = false;
+	float mTerrainOriginY = 125.0f;  // above PBR spheres (y=120)
+
+	// ---------------- DXR (RayQuery) shadows ----------------
+	bool mEnableDxrShadows = true;
+	bool mVisualizeDxrShadowMask = false;
+	UINT mDxrShadowSamples = 1;           // safe default (TAA accumulates)
+	int mDxrShadowDownscale = 2;          // 1=full,2=half,4=quarter
+	int mPrevDxrShadowDownscale = 2;
+	bool mDxrUpdateTlasEveryFrame = false;
+	float mDxrConeAngleDeg = 1.0f;        // cone half-angle (deg), 0 = hard
+	float mDxrMaxDistance = 2000.0f;
+	float mDxrNormalBias = 0.02f;
+	UINT mDxrFrameIndex = 0;
+	int mDxrShadowLightCBIndex = 0; // which LightCBIndex uses DXR mask (directional)
+
+	ComPtr<ID3D12RootSignature> mDxrShadowRootSignature = nullptr;
+	ComPtr<ID3D12PipelineState> mDxrShadowPSO = nullptr;
+	ComPtr<ID3DBlob> mDxrShadowCS = nullptr;
+
+	ComPtr<ID3D12Resource> mDxrShadowMask = nullptr; // R16_FLOAT UAV/SRV
+	D3D12_RESOURCE_STATES mDxrShadowMaskState = D3D12_RESOURCE_STATE_COMMON;
+
+	// Acceleration structures
+	ComPtr<ID3D12Resource> mDxrBlasScratch = nullptr;
+	ComPtr<ID3D12Resource> mDxrTlasScratch = nullptr;
+	ComPtr<ID3D12Resource> mDxrTlas = nullptr;
+	std::vector<ComPtr<ID3D12Resource>> mDxrInstanceDescs; // per-frame instance desc buffers (upload)
+	std::vector<ComPtr<ID3D12Resource>> mDxrBlas; // cached BLAS per unique submesh
+	struct DxrInstanceRef
+	{
+		RenderItem* Ri = nullptr;
+		UINT BlasIndex = 0;
+	};
+	std::vector<DxrInstanceRef> mDxrInstances; // TLAS instance list (stable order)
+
+	// Descriptor heap indices (allocated in BuildDescriptorHeaps)
+	int mDxrTlasSrvIndex = -1;
+	int mDxrShadowMaskUavIndex = -1;
+	int mDxrShadowMaskSrvIndex = -1;
+
+	struct DxrShadowConstants
+	{
+		DirectX::XMFLOAT3 LightDirW = { 0.0f, -1.0f, 0.0f };
+		float ConeAngleRad = 0.0f;
+		UINT SampleCount = 1;
+		UINT FrameIndex = 0;
+		UINT Downscale = 1;
+		UINT _pad0 = 0;
+		float MaxDistance = 2000.0f;
+		float NormalBias = 0.02f;
+		DirectX::XMFLOAT2 _pad1 = { 0.0f, 0.0f };
+	};
+	std::unique_ptr<UploadBuffer<DxrShadowConstants>> mDxrShadowCB = nullptr;
 
 	bool mDayNightCycleEnabled = false;
 	float mDayNightCycleDuration = 7.0f; // day timing
@@ -426,6 +591,19 @@ bool TexColumnsApp::Initialize()
 	BuildMaterials();
 	BuildPSOs();
 	BuildRenderItems();
+	BuildDxrShadowRootSignature();
+	BuildDxrShadowPSO();
+	CreateDxrShadowMaskResources();
+	BuildDxrAccelerationStructures();
+	CreateDxrShadowDescriptors();
+	BuildTerrainGeometry();
+	mTerrain = std::make_unique<Terrain>();
+	mTerrain->SetWorldSize(mTerrainWorldSize);
+	mTerrain->SetHeightScale(mTerrainHeightScale);
+	mTerrain->SetOriginY(mTerrainOriginY);
+	mTerrain->SetLODDistances(mTerrainWorldSize * mTerrainLOD1Factor, mTerrainWorldSize * mTerrainLOD2Factor);
+	mTerrain->BuildQuadtree();
+	mTerrain->AssignHeightmapIndices(mTerrainHeightmapIndicesLOD0, mTerrainHeightmapIndicesLOD1, mTerrainHeightmapIndicesLOD2);
 	BuildFrameResources();
 
 	D3D12_DESCRIPTOR_HEAP_DESC imGuiHeapDesc = {};
@@ -455,6 +633,7 @@ bool TexColumnsApp::Initialize()
 	init_info.LegacySingleSrvGpuDescriptor = mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
 	ImGui_ImplWin32_Init(mhMainWnd);
 	ImGui_ImplDX12_Init(&init_info);
+	mImGuiInitialized = true;
 	// Execute the initialization commands.
 	ThrowIfFailed(mCommandList->Close());
 	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
@@ -525,6 +704,8 @@ void TexColumnsApp::OnResize()
 	CreateTaaHistoryRtvs();       // <-- RTV для history 
 	CreateTaaDepthHistoryTextures();
 	BuildDescriptorHeaps();
+	CreateDxrShadowMaskResources();
+	CreateDxrShadowDescriptors();
 
 	XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
 
@@ -652,6 +833,52 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	//ImGui::DragFloat("ClampExpand", &mTaaClampExpand, 0.001f, 0.0f, 1.0f);
 	ImGui::End();
 
+	ImGui::Begin("DXR Shadows");
+	ImGui::Checkbox("Enable DXR (RayQuery) shadows", &mEnableDxrShadows);
+	ImGui::Checkbox("Visualize shadow mask", &mVisualizeDxrShadowMask);
+	ImGui::Checkbox("Update TLAS every frame", &mDxrUpdateTlasEveryFrame);
+	int maxLightIdx = (int)mLights.size() - 1;
+	if (maxLightIdx < 0) maxLightIdx = 0;
+	ImGui::DragInt("DXR light index (LightCBIndex)", &mDxrShadowLightCBIndex, 1.0f, 0, maxLightIdx);
+	{
+		const char* items[] = { "1x (full)", "2x (half)", "4x (quarter)" };
+		int cur = (mDxrShadowDownscale == 1) ? 0 : (mDxrShadowDownscale == 2) ? 1 : 2;
+		if (ImGui::Combo("Mask downscale", &cur, items, IM_ARRAYSIZE(items)))
+			mDxrShadowDownscale = (cur == 0) ? 1 : (cur == 1) ? 2 : 4;
+	}
+	ImGui::SliderInt("Samples / pixel", (int*)&mDxrShadowSamples, 1, 16);
+	ImGui::SliderFloat("Cone angle (deg)", &mDxrConeAngleDeg, 0.0f, 5.0f, "%.2f");
+	ImGui::DragFloat("Max distance", &mDxrMaxDistance, 10.0f, 1.0f, 20000.0f, "%.0f");
+	ImGui::DragFloat("Normal bias", &mDxrNormalBias, 0.001f, 0.0f, 0.2f, "%.4f");
+	ImGui::Text("BLAS: %zu  TLAS instances: %zu", mDxrBlas.size(), mDxrInstances.size());
+	ImGui::Text("Mask: %s  TLAS: %s  PSO: %s",
+		(mDxrShadowMask ? "OK" : "null"),
+		(mDxrTlas ? "OK" : "null"),
+		(mDxrShadowPSO ? "OK" : "null"));
+	ImGui::End();
+
+	// Recreate DXR shadow mask if downscale changed (expensive; only when user tweaks).
+	if (mDxrShadowDownscale != mPrevDxrShadowDownscale)
+	{
+		mDxrShadowDownscale = (mDxrShadowDownscale <= 1) ? 1 : (mDxrShadowDownscale <= 2) ? 2 : 4;
+		mPrevDxrShadowDownscale = mDxrShadowDownscale;
+		FlushCommandQueue();
+		CreateDxrShadowMaskResources();
+		CreateDxrShadowDescriptors();
+	}
+
+	ImGui::Begin("Terrain");
+	ImGui::Checkbox("Enable terrain", &mTerrainEnabled);
+	ImGui::Checkbox("Wireframe (debug)", &mTerrainWireframe);
+	ImGui::DragFloat("Origin Y (above spheres)", &mTerrainOriginY, 1.0f, -100.0f, 300.0f);
+	ImGui::DragFloat("World size (XZ)", &mTerrainWorldSize, 1.0f, 10.0f, 500.0f);
+	ImGui::DragFloat("Height scale", &mTerrainHeightScale, 0.5f, 1.0f, 200.0f);
+	ImGui::DragFloat("LOD1 distance factor", &mTerrainLOD1Factor, 0.05f, 0.1f, 2.0f, "%.2f");
+	ImGui::DragFloat("LOD2 distance factor", &mTerrainLOD2Factor, 0.05f, 0.05f, 1.0f, "%.2f");
+	if (mTerrain)
+		ImGui::Text("Visible tiles: %zu", mTerrain->GetVisibleTiles().size());
+	ImGui::End();
+
 	TAAConstants c = {};
 	c.Alpha = mTaaAlpha;
 	c.ClampExpand = mTaaClampExpand;
@@ -664,6 +891,59 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	OutputDebugStringA(("alpha=" + std::to_string(mTaaAlpha) + "\n").c_str());
 
 	UpdateMainPassCB(gt);
+	if (mTerrain)
+	{
+		mTerrain->SetHeightScale(mTerrainHeightScale);
+		mTerrain->SetOriginY(mTerrainOriginY);
+		mTerrain->SetLODDistances(mTerrainWorldSize * mTerrainLOD1Factor, mTerrainWorldSize * mTerrainLOD2Factor);
+		if (mTerrain->GetWorldSizeXZ() != mTerrainWorldSize)
+		{
+			mTerrain->SetWorldSize(mTerrainWorldSize);
+			mTerrain->BuildQuadtree();
+			mTerrain->AssignHeightmapIndices(mTerrainHeightmapIndicesLOD0, mTerrainHeightmapIndicesLOD1, mTerrainHeightmapIndicesLOD2);
+		}
+		mTerrain->Update(mMainPassCB.ViewProj, mMainPassCB.EyePosW);
+	}
+
+	// DXR shadow constants (updated every frame; TAA will filter noise)
+	if (mEnableDxrShadows && mDxrShadowCB != nullptr)
+	{
+		if (!mLights.empty())
+			mDxrShadowLightCBIndex = std::clamp(mDxrShadowLightCBIndex, 0, (int)mLights.size() - 1);
+		else
+			mDxrShadowLightCBIndex = 0;
+
+		XMFLOAT3 lightDir = { 0.0f, -1.0f, 0.0f };
+		bool found = false;
+
+		// 1) Preferred: selected light index, if it's a directional light that casts shadows.
+		for (const auto& l : mLights)
+			if (l.LightCBIndex == mDxrShadowLightCBIndex && l.type == 2 && l.CastsShadows)
+			{
+				lightDir = l.Direction;
+				found = true;
+				break;
+			}
+
+		// 2) Fallback: first shadow-casting directional light.
+		if (!found)
+			for (const auto& l : mLights)
+				if (l.type == 2 && l.CastsShadows)
+				{
+					lightDir = l.Direction;
+					break;
+				}
+
+		DxrShadowConstants dxr = {};
+		dxr.LightDirW = lightDir;
+		dxr.ConeAngleRad = XMConvertToRadians(mDxrConeAngleDeg);
+		dxr.SampleCount = max(1u, mDxrShadowSamples);
+		dxr.FrameIndex = mDxrFrameIndex++;
+		dxr.Downscale = (UINT)((mDxrShadowDownscale <= 1) ? 1 : (mDxrShadowDownscale <= 2) ? 2 : 4);
+		dxr.MaxDistance = mDxrMaxDistance;
+		dxr.NormalBias = mDxrNormalBias;
+		mDxrShadowCB->CopyData(mCurrFrameResourceIndex, dxr);
+	}
 }
 
 
@@ -946,6 +1226,7 @@ void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 			l.enablePCF = c;
 
 			ImGui::DragInt("PCF level", &l.pcf_level, 1, 0, 100);
+			ImGui::DragFloat("Shadow softness (texels)", &l.ShadowSoftness, 0.5f, 0.0f, 32.0f, "%.1f");
 
 			ImGui::PopID();
 
@@ -992,6 +1273,7 @@ void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 			bool b = l.CastsShadows;
 			ImGui::Checkbox("Cast Shadows", &b);
 			l.CastsShadows = b;
+			ImGui::DragFloat("Shadow softness (texels)", &l.ShadowSoftness, 0.5f, 0.0f, 32.0f, "%.1f");
 
 			b = l.isDebugOn;
 			ImGui::Checkbox("is Debug On", &b);
@@ -1028,6 +1310,7 @@ void TexColumnsApp::UpdateLightCBs(const GameTimer& gt)
 			XMStoreFloat4x4(&l.LightProj, lightProj);
 			XMStoreFloat4x4(&l.LightViewProj, XMMatrixTranspose(XMMatrixMultiply(lightView, lightProj)));
 		}
+
 		lConst.light = l;
 		shConst.LightViewProj = l.LightViewProj;
 		currShadowCB->CopyData(l.LightCBIndex, shConst);
@@ -1318,6 +1601,24 @@ void TexColumnsApp::LoadAllTextures()
 	tryLoad("textures/irradiance");
 	tryLoad("textures/brdfLUT");
 	tryLoad("textures/skybox");
+
+	LoadTerrainTextures();
+}
+
+void TexColumnsApp::LoadTerrainTextures()
+{
+	auto tryLoad = [&](const std::string& name) {
+		if (mTextures.find(name) == mTextures.end())
+			LoadTexture(name);
+	};
+	tryLoad("001/Height_Out");
+	tryLoad("002/Height/Height_Out_y0_x0");
+	tryLoad("002/Height/Height_Out_y0_x1");
+	tryLoad("002/Height/Height_Out_y1_x0");
+	tryLoad("002/Height/Height_Out_y1_x1");
+	for (int z = 0; z < 4; ++z)
+		for (int x = 0; x < 4; ++x)
+			tryLoad("003/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x));
 }
 
 void TexColumnsApp::LoadTexture(const std::string& name)
@@ -1545,6 +1846,80 @@ void TexColumnsApp::BuildPostProcessRootSignature()
 		serializedRootSig->GetBufferSize(),
 		IID_PPV_ARGS(mPostProcessRootSignature.GetAddressOf())));
 }
+
+void TexColumnsApp::BuildDxrShadowRootSignature()
+{
+	// DXR 1.1 inline ray tracing compute root signature:
+	// t0 = TLAS, t1 = Position, t2 = Normal, u0 = ShadowMask, b0 = constants
+	CD3DX12_DESCRIPTOR_RANGE tlasRange;
+	tlasRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0);
+	CD3DX12_DESCRIPTOR_RANGE posRange;
+	posRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);
+	CD3DX12_DESCRIPTOR_RANGE nrmRange;
+	nrmRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2);
+	CD3DX12_DESCRIPTOR_RANGE outRange;
+	outRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0);
+
+	CD3DX12_ROOT_PARAMETER params[5];
+	params[0].InitAsDescriptorTable(1, &tlasRange);
+	params[1].InitAsDescriptorTable(1, &posRange);
+	params[2].InitAsDescriptorTable(1, &nrmRange);
+	params[3].InitAsDescriptorTable(1, &outRange);
+	params[4].InitAsConstantBufferView(0);
+
+	CD3DX12_ROOT_SIGNATURE_DESC rsDesc;
+	rsDesc.Init(_countof(params), params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+	ComPtr<ID3DBlob> serialized = nullptr;
+	ComPtr<ID3DBlob> errors = nullptr;
+	HRESULT hr = D3D12SerializeRootSignature(&rsDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+		serialized.GetAddressOf(), errors.GetAddressOf());
+	if (errors) ::OutputDebugStringA((char*)errors->GetBufferPointer());
+	ThrowIfFailed(hr);
+
+	ThrowIfFailed(md3dDevice->CreateRootSignature(0,
+		serialized->GetBufferPointer(), serialized->GetBufferSize(),
+		IID_PPV_ARGS(mDxrShadowRootSignature.GetAddressOf())));
+}
+
+void TexColumnsApp::BuildDxrShadowPSO()
+{
+	// Check DXR support.
+	D3D12_FEATURE_DATA_D3D12_OPTIONS5 opts5 = {};
+	if (FAILED(md3dDevice->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &opts5, sizeof(opts5))) ||
+		opts5.RaytracingTier < D3D12_RAYTRACING_TIER_1_1)
+	{
+		mEnableDxrShadows = false;
+		return;
+	}
+
+	// RayQuery requires SM 6.5.
+	D3D12_FEATURE_DATA_SHADER_MODEL sm = { D3D_SHADER_MODEL_6_5 };
+	if (FAILED(md3dDevice->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm))) ||
+		sm.HighestShaderModel < D3D_SHADER_MODEL_6_5)
+	{
+		mEnableDxrShadows = false;
+		return;
+	}
+
+	// Compile RayQuery compute shader with DXC (cs_6_5).
+	// If DXC is missing at runtime (dxcompiler.dll), fall back to shadow maps instead of crashing.
+	try
+	{
+		mDxrShadowCS = CompileShaderDXC(L"Shaders\\DxrShadowMask.hlsl", L"CS", L"cs_6_5");
+
+		D3D12_COMPUTE_PIPELINE_STATE_DESC pso = {};
+		pso.pRootSignature = mDxrShadowRootSignature.Get();
+		pso.CS = { (BYTE*)mDxrShadowCS->GetBufferPointer(), mDxrShadowCS->GetBufferSize() };
+		ThrowIfFailed(md3dDevice->CreateComputePipelineState(&pso, IID_PPV_ARGS(&mDxrShadowPSO)));
+	}
+	catch (const DxException&)
+	{
+		mEnableDxrShadows = false;
+		mDxrShadowCS = nullptr;
+		mDxrShadowPSO = nullptr;
+	}
+}
 void TexColumnsApp::CreatePointLight(XMFLOAT3 pos, XMFLOAT3 color, float faloff_start, float faloff_end, float strength)
 {
 	Light light = {};
@@ -1587,22 +1962,39 @@ void TexColumnsApp::CreateSpotLight(XMFLOAT3 pos, XMFLOAT3 rot, XMFLOAT3 color, 
 
 void TexColumnsApp::BuildLights()
 {
-	// directional (strong main light so reflections are visible on spheres)
+	// Directional 1 (main sun) — включаем тени, чтобы видеть RT-тени
 	Light dir = {};
 	dir.LightCBIndex = mLights.size();
-	dir.Position = { 0,300,0 };
-	dir.Direction = { 0.2f, -0.95f, 0.2f }; // slightly from above-front for clear highlights
-	dir.Color = { 1,1,1 };
+	dir.Position = { 0, 300, 0 };
+	dir.Direction = { 0.2f, -0.95f, 0.2f };
+	dir.Color = { 1, 1, 1 };
 	dir.Strength = 3.0f;
-	dir.CastsShadows = false;
+	dir.CastsShadows = true;
 	dir.enablePCF = false;
 	dir.pcf_level = 0;
+	dir.ShadowSoftness = 6.0f;
 	dir.isDebugOn = false;
 	dir.type = 2;
 	dir.LightUp = XMVectorSet(0, 0, -1, 0);
-	auto& world = XMMatrixScaling(1000, 1000, 1000);
-	XMStoreFloat4x4(&dir.gWorld, XMMatrixTranspose(world));
+	XMStoreFloat4x4(&dir.gWorld, XMMatrixTranspose(XMMatrixScaling(1000, 1000, 1000)));
 	mLights.push_back(dir);
+
+	// Directional 2 (второй источник — сбоку, чтобы видеть вторую тень)
+	Light dir2 = {};
+	dir2.LightCBIndex = mLights.size();
+	dir2.Position = { 150, 80, 150 };
+	dir2.Direction = { -0.7f, -0.5f, -0.5f };
+	dir2.Color = { 0.9f, 0.85f, 0.7f };
+	dir2.Strength = 1.5f;
+	dir2.CastsShadows = true;
+	dir2.enablePCF = false;
+	dir2.pcf_level = 0;
+	dir2.ShadowSoftness = 4.0f;
+	dir2.isDebugOn = false;
+	dir2.type = 2;
+	dir2.LightUp = XMVectorSet(0, 1, 0, 0);
+	XMStoreFloat4x4(&dir2.gWorld, XMMatrixTranspose(XMMatrixScaling(1000, 1000, 1000)));
+	mLights.push_back(dir2);
 
 	Light ambient = {};
 	ambient.LightCBIndex = mLights.size();
@@ -1658,8 +2050,14 @@ void TexColumnsApp::CreateMaterial(std::string _name, int _CBIndex, int _SRVDiff
 
 void TexColumnsApp::BuildShadowMapViews()
 {
+	int shadowMapCount = 0;
+	for (const auto& light : mLights)
+		if (light.type == 2 || light.type == 3)
+			shadowMapCount++;
+	shadowMapCount = max(shadowMapCount, 1);
+
 	D3D12_DESCRIPTOR_HEAP_DESC dsvHeapDesc = {};
-	dsvHeapDesc.NumDescriptors = 2; // For one shadow map
+	dsvHeapDesc.NumDescriptors = shadowMapCount;
 	dsvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
 	dsvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
 
@@ -1698,7 +2096,7 @@ void TexColumnsApp::BuildShadowMapViews()
 				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
 				D3D12_HEAP_FLAG_NONE,
 				&texDesc,
-				D3D12_RESOURCE_STATE_GENERIC_READ, 
+				D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 				&clearValue,
 				IID_PPV_ARGS(&light.ShadowMap)));
 
@@ -1729,6 +2127,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	// [after that .. +shadowCount-1]               : Shadow maps SRVs (packed contiguous)
 	// [TAA table 0: 4 SRVs contiguous]             : [Scene][Hist0][DepthCur][PrevDepth0]
 	// [TAA table 1: 4 SRVs contiguous]             : [Scene][Hist1][DepthCur][PrevDepth1]
+	// [DXR (3 descriptors)]                        : [TLAS SRV][ShadowMask UAV][ShadowMask SRV]
 	// =========================================================
 
 	// 0) Count shadow SRVs
@@ -1740,6 +2139,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	const int texturesCount = (int)mTextures.size();
 	const int kGbufferCount = 4; // Albedo, Normal, Position, Velocity
 	const int kTaaCount = 10; // 2 tables * 5 SRVs
+	const int kDxrCount = 3; // TLAS SRV + ShadowMask UAV + ShadowMask SRV
 
 
 	const int baseTextures = 0;
@@ -1753,6 +2153,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 
 	const int baseShadows = baseGbuffer + kGbufferCount;
 	const int baseTaa = baseShadows + shadowCount;
+	const int baseDxr = baseTaa + kTaaCount;
 
 	// table0
 	const int taa0_scene = baseTaa + 0;
@@ -1768,16 +2169,43 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	const int taa1_prevDepth = baseTaa + 8;
 	const int taa1_velocity = baseTaa + 9;
 
-	const int totalSrvCount = texturesCount + kGbufferCount + shadowCount + kTaaCount;
+	const int totalSrvCount = texturesCount + kGbufferCount + shadowCount + kTaaCount + kDxrCount;
 
-	// 1) Create SRV heap
-	D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
-	srvHeapDesc.NumDescriptors = (UINT)totalSrvCount;
-	srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+	// DXR descriptor indices (filled later when resources exist)
+	mDxrTlasSrvIndex = baseDxr + 0;
+	mDxrShadowMaskUavIndex = baseDxr + 1;
+	mDxrShadowMaskSrvIndex = baseDxr + 2;
 
+	// 1) Create SRV heap (only if needed). Recreating it after ImGui init can break ImGui.
+	bool needCreate = true;
+	if (mSrvDescriptorHeap)
+	{
+		auto existing = mSrvDescriptorHeap->GetDesc();
+		if (existing.NumDescriptors >= (UINT)totalSrvCount)
+			needCreate = false;
+	}
 
-	ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
+	if (needCreate)
+	{
+		// If ImGui is already initialized, avoid recreating the heap (it will hold stale handles).
+		if (mImGuiInitialized)
+		{
+			// Fall back: keep the old heap and disable DXR features that add descriptors.
+			mEnableDxrShadows = false;
+			// Recompute without DXR descriptors.
+			// Note: this should not happen in normal flow; SRV heap should be sized once after textures load.
+			// (We still continue and overwrite views into the existing heap.)
+		}
+		else
+		{
+			D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+			srvHeapDesc.NumDescriptors = (UINT)totalSrvCount;
+			srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+			srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+			ThrowIfFailed(md3dDevice->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&mSrvDescriptorHeap)));
+		}
+	}
 
 	auto cpuAt = [&](int idx)
 		{
@@ -1885,6 +2313,34 @@ void TexColumnsApp::BuildDescriptorHeaps()
 		TexOffsets[kv.first] = texIndex;
 		texIndex++;
 	}
+
+	// Terrain heightmap indices for quadtree LOD
+	mTerrainHeightmapIndicesLOD0.clear();
+	mTerrainHeightmapIndicesLOD1.clear();
+	mTerrainHeightmapIndicesLOD2.clear();
+	auto texIdx = [&](const std::string& name) -> int {
+		auto it = TexOffsets.find(name);
+		return (it != TexOffsets.end()) ? it->second : -1;
+	};
+	if (texIdx("001/Height_Out") >= 0)
+		mTerrainHeightmapIndicesLOD0.push_back(texIdx("001/Height_Out"));
+	for (int z = 0; z < 2; ++z)
+		for (int x = 0; x < 2; ++x) {
+			std::string n = "002/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x);
+			if (texIdx(n) >= 0) mTerrainHeightmapIndicesLOD1.push_back(texIdx(n));
+		}
+	for (int z = 0; z < 4; ++z)
+		for (int x = 0; x < 4; ++x) {
+			std::string n = "003/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x);
+			if (texIdx(n) >= 0) mTerrainHeightmapIndicesLOD2.push_back(texIdx(n));
+		}
+	// Fallback heightmap when 001/002/003 not loaded (so terrain still draws)
+	int fallback = texIdx("textures/HeightMap2");
+	if (fallback < 0) fallback = texIdx("textures/HeightMap");
+	if (fallback < 0 && !TexOffsets.empty()) fallback = TexOffsets.begin()->second;
+	mTerrainFallbackHeightmapIndex = (fallback >= 0) ? fallback : -1;
+	if (mTerrainHeightmapIndicesLOD0.empty() && mTerrainFallbackHeightmapIndex >= 0)
+		mTerrainHeightmapIndicesLOD0.push_back(mTerrainFallbackHeightmapIndex);
 
 	// 3) GBuffer SRV
 	D3D12_SHADER_RESOURCE_VIEW_DESC gbufSrvDesc = {};
@@ -2024,6 +2480,8 @@ void TexColumnsApp::BuildShadersAndInputLayout()
 	mShaders["postprocessPS"] = d3dUtil::CompileShader(L"Shaders\\PostProcess.hlsl", nullptr, "PS", "ps_5_0");
 	mShaders["taaResolveVS"] = d3dUtil::CompileShader(L"Shaders\\TAAResolve.hlsl", nullptr, "VS", "vs_5_1");
 	mShaders["taaResolvePS"] = d3dUtil::CompileShader(L"Shaders\\TAAResolve.hlsl", nullptr, "PS", "ps_5_1");
+	mShaders["terrainVS"] = d3dUtil::CompileShader(L"Shaders\\Terrain.hlsl", nullptr, "VS", "vs_5_0");
+	mShaders["terrainPS"] = d3dUtil::CompileShader(L"Shaders\\Terrain.hlsl", nullptr, "PS", "ps_5_0");
 
 	mInputLayout =
 	{
@@ -2312,6 +2770,49 @@ void TexColumnsApp::BuildShapeGeometry()
 	mGeometries[geo->Name] = std::move(geo);
 }
 
+void TexColumnsApp::BuildTerrainGeometry()
+{
+	GeometryGenerator geoGen;
+	GeometryGenerator::MeshData grid = geoGen.CreateGrid(1.0f, 1.0f, 64, 64);
+
+	std::vector<Vertex> vertices(grid.Vertices.size());
+	for (size_t i = 0; i < grid.Vertices.size(); ++i)
+	{
+		const auto& gv = grid.Vertices[i];
+		vertices[i].Pos = XMFLOAT3(gv.Position.x + 0.5f, gv.Position.y, gv.Position.z + 0.5f);
+		vertices[i].Normal = gv.Normal;
+		vertices[i].TexC = gv.TexC;
+		vertices[i].Tangent = gv.TangentU;
+	}
+
+	std::vector<std::uint16_t> indices(grid.GetIndices16().begin(), grid.GetIndices16().end());
+
+	SubmeshGeometry terrainSubmesh;
+	terrainSubmesh.IndexCount = (UINT)indices.size();
+	terrainSubmesh.StartIndexLocation = 0;
+	terrainSubmesh.BaseVertexLocation = 0;
+
+	const UINT vbByteSize = (UINT)vertices.size() * sizeof(Vertex);
+	const UINT ibByteSize = (UINT)indices.size() * sizeof(std::uint16_t);
+
+	auto geo = std::make_unique<MeshGeometry>();
+	geo->Name = "terrainGrid";
+	ThrowIfFailed(D3DCreateBlob(vbByteSize, &geo->VertexBufferCPU));
+	CopyMemory(geo->VertexBufferCPU->GetBufferPointer(), vertices.data(), vbByteSize);
+	ThrowIfFailed(D3DCreateBlob(ibByteSize, &geo->IndexBufferCPU));
+	CopyMemory(geo->IndexBufferCPU->GetBufferPointer(), indices.data(), ibByteSize);
+	geo->VertexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), vertices.data(), vbByteSize, geo->VertexBufferUploader);
+	geo->IndexBufferGPU = d3dUtil::CreateDefaultBuffer(md3dDevice.Get(),
+		mCommandList.Get(), indices.data(), ibByteSize, geo->IndexBufferUploader);
+	geo->VertexByteStride = sizeof(Vertex);
+	geo->VertexBufferByteSize = vbByteSize;
+	geo->IndexFormat = DXGI_FORMAT_R16_UINT;
+	geo->IndexBufferByteSize = ibByteSize;
+	geo->DrawArgs["terrain"] = terrainSubmesh;
+	mGeometries[geo->Name] = std::move(geo);
+}
+
 void TexColumnsApp::BuildPSOs()
 {
 	const DXGI_FORMAT SceneColorFormat = mBackBufferFormat; // <- set to the EXACT format of mSceneTexture and TAA history.
@@ -2363,6 +2864,38 @@ void TexColumnsApp::BuildPSOs()
 		ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&mPSOs["gbuffer"])));
 	}
 
+	// TERRAIN (same MRT as gbuffer, heightmap in VS)
+	{
+		auto pso = DefaultPso();
+		pso.pRootSignature = mRootSignature.Get();
+		pso.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+		pso.VS = { (BYTE*)mShaders["terrainVS"]->GetBufferPointer(), mShaders["terrainVS"]->GetBufferSize() };
+		pso.PS = { (BYTE*)mShaders["terrainPS"]->GetBufferPointer(), mShaders["terrainPS"]->GetBufferSize() };
+		pso.NumRenderTargets = 4;
+		pso.RTVFormats[0] = albedoFormat;
+		pso.RTVFormats[1] = normalFormat;
+		pso.RTVFormats[2] = positionFormat;
+		pso.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
+		pso.DSVFormat = mDepthStencilFormat;
+		ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&mPSOs["terrain"])));
+	}
+	// TERRAIN WIREFRAME (debug)
+	{
+		auto pso = DefaultPso();
+		pso.pRootSignature = mRootSignature.Get();
+		pso.InputLayout = { mInputLayout.data(), (UINT)mInputLayout.size() };
+		pso.VS = { (BYTE*)mShaders["terrainVS"]->GetBufferPointer(), mShaders["terrainVS"]->GetBufferSize() };
+		pso.PS = { (BYTE*)mShaders["terrainPS"]->GetBufferPointer(), mShaders["terrainPS"]->GetBufferSize() };
+		pso.NumRenderTargets = 4;
+		pso.RTVFormats[0] = albedoFormat;
+		pso.RTVFormats[1] = normalFormat;
+		pso.RTVFormats[2] = positionFormat;
+		pso.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
+		pso.DSVFormat = mDepthStencilFormat;
+		pso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+		pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+		ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&mPSOs["terrain_wireframe"])));
+	}
 
 	// SHADOW MAP
 	{
@@ -2497,13 +3030,15 @@ void TexColumnsApp::BuildFrameResources()
 	mFrameResources.clear();
 	for (int i = 0; i < gNumFrameResources; ++i)
 	{
+		// +1 object slot for terrain tiles
 		mFrameResources.push_back(std::make_unique<FrameResource>(md3dDevice.Get(),
-			1, (UINT)mAllRitems.size(), (UINT)mMaterials.size(), (UINT)mLights.size()));
+			1, (UINT)mAllRitems.size() + 1, (UINT)mMaterials.size(), (UINT)mLights.size()));
 	}
 	mChromaticAberrationCB = std::make_unique<UploadBuffer<float>>(md3dDevice.Get(), 1, true);
 	mTaaCB = std::make_unique<UploadBuffer<TAAConstants>>(md3dDevice.Get(), 1, true);
 	mTaaReprojectCB = std::make_unique<UploadBuffer<TAAReprojectConstants>>(md3dDevice.Get(), 1, true);
 	mAtmosphereCB = std::make_unique<UploadBuffer<AtmosphereConstants>>(md3dDevice.Get(), 1, true);
+	mDxrShadowCB = std::make_unique<UploadBuffer<DxrShadowConstants>>(md3dDevice.Get(), gNumFrameResources, true);
 
 	mCurrFrameResourceIndex = 0;
 	mCurrFrameResource = mFrameResources[mCurrFrameResourceIndex].get();
@@ -2568,6 +3103,10 @@ void TexColumnsApp::BuildMaterials()
 				metallic);
 		}
 	}
+	int terrainTex = (TexOffsets.find("001/Height_Out") != TexOffsets.end()) ? TexOffsets["001/Height_Out"] : TexOffsets["textures/HeightMap2"];
+	CreateMaterial("TerrainMat", 0, terrainTex, terrainTex,
+		XMFLOAT4(0.4f, 0.5f, 0.3f, 1.0f), XMFLOAT3(0.04f, 0.04f, 0.04f), 0.9f, 0.0f);
+	mTerrainMaterialIndex = mMaterials["TerrainMat"]->MatCBIndex;
 }
 void TexColumnsApp::RenderCustomMesh(std::string unique_name, std::string meshname, std::string materialName, XMFLOAT3 Scale, XMFLOAT3 Rotation, XMFLOAT3 Position)
 {
@@ -2624,6 +3163,23 @@ void TexColumnsApp::BuildRenderItems()
 	boxRitem->StartIndexLocation = boxRitem->Geo->DrawArgs["box"].StartIndexLocation;
 	boxRitem->BaseVertexLocation = boxRitem->Geo->DrawArgs["box"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(boxRitem));
+
+	// Объект для проверки RT-теней: куб перед сценой, отбрасывает тень на землю/спонзу
+	auto shadowTestRitem = std::make_unique<RenderItem>();
+	shadowTestRitem->Name = "shadowTestBox";
+	XMStoreFloat4x4(&shadowTestRitem->World,
+		XMMatrixScaling(4.0f, 4.0f, 4.0f) * XMMatrixTranslation(25.0f, 4.0f, 0.0f));
+	shadowTestRitem->PrevWorld = shadowTestRitem->World;
+	XMStoreFloat4x4(&shadowTestRitem->TexTransform, XMMatrixScaling(1, 1, 1));
+	shadowTestRitem->ObjCBIndex = (UINT)mAllRitems.size();
+	shadowTestRitem->Mat = mMaterials["NiggaMat"].get();
+	shadowTestRitem->BaseMat = shadowTestRitem->Mat;
+	shadowTestRitem->Geo = mGeometries["shapeGeo"].get();
+	shadowTestRitem->PrimitiveType = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+	shadowTestRitem->IndexCount = shadowTestRitem->Geo->DrawArgs["box"].IndexCount;
+	shadowTestRitem->StartIndexLocation = shadowTestRitem->Geo->DrawArgs["box"].StartIndexLocation;
+	shadowTestRitem->BaseVertexLocation = shadowTestRitem->Geo->DrawArgs["box"].BaseVertexLocation;
+	mAllRitems.push_back(std::move(shadowTestRitem));
 
 	RenderCustomMesh("building", "sponza", "", XMFLOAT3(0.07, 0.07, 0.07), XMFLOAT3(0, 3.14 / 2, 0), XMFLOAT3(0, 0, 0));
 	RenderCustomMesh("nigga", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, 3.14, 0), XMFLOAT3(0, 3, 0));
@@ -2774,7 +3330,7 @@ void TexColumnsApp::DrawSceneToShadowMap()
 				mCommandList->RSSetScissorRects(1, &mShadowScissorRect);
 				// Transition the shadow map from generic read to depth-write.
 				mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(light.ShadowMap.Get(),
-					D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_DEPTH_WRITE));
+					D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_DEPTH_WRITE));
 
 				// Clear the shadow map.
 				mCommandList->ClearDepthStencilView(light.ShadowMapDsvHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
@@ -2867,13 +3423,19 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	mCommandList->SetGraphicsRootSignature(mRootSignature.Get());
 	mCommandList->SetGraphicsRootConstantBufferView(3, passCB->GetGPUVirtualAddress());
 
+	DrawTerrain(mCommandList.Get());
 	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
 
 	// GBuffer -> SRV для lighting
-	Transition(mGBufferAlbedo.Get(), mGBufferState[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-	Transition(mGBufferNormal.Get(), mGBufferState[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-	Transition(mGBufferPosition.Get(), mGBufferState[2], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-	Transition(mGBufferVelocity.Get(), mGBufferState[3], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+	const D3D12_RESOURCE_STATES kSrvRead =
+		(D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+	Transition(mGBufferAlbedo.Get(), mGBufferState[0], kSrvRead);
+	Transition(mGBufferNormal.Get(), mGBufferState[1], kSrvRead);
+	Transition(mGBufferPosition.Get(), mGBufferState[2], kSrvRead);
+	Transition(mGBufferVelocity.Get(), mGBufferState[3], kSrvRead);
+
+	// DXR shadow mask pass (RayQuery compute) before lighting
+	DispatchDxrShadowMask(mCommandList.Get());
 
 	// 2) LIGHTING PASS -> mSceneTexture
 	Transition(mSceneTexture.Get(), mSceneState, D3D12_RESOURCE_STATE_RENDER_TARGET);
@@ -2944,9 +3506,7 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 		mCommandList->SetGraphicsRootDescriptorTable(13, h);
 	}
 
-	// b3 debug constants (mode)
-	UINT debugConsts[4] = { (UINT)gVelocityDebugMode, 0, 0, 0 };
-	mCommandList->SetGraphicsRoot32BitConstants(9, 4, debugConsts, 0);
+	// b3 debug constants are set per-light (so DXR mask is used only for one selected light).
 
 	// b4 atmosphere (sun + rayleigh/mie/turbidity)
 	if (mAtmosphereCB != nullptr)
@@ -2960,6 +3520,21 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 
 	for (auto& light : mLights)
 	{
+		const bool useDxrThisLight =
+			(mEnableDxrShadows && mDxrShadowMask && mDxrTlas && mDxrShadowMaskSrvIndex >= 0) &&
+			(light.CastsShadows) &&
+			(light.type == 2) && // directional only (one mask per frame)
+			(light.LightCBIndex == mDxrShadowLightCBIndex);
+
+		UINT debugConsts[4] =
+		{
+			(UINT)gVelocityDebugMode,
+			(UINT)(useDxrThisLight ? 1 : 0),
+			(UINT)((useDxrThisLight && mVisualizeDxrShadowMask) ? 1 : 0),
+			0u
+		};
+		mCommandList->SetGraphicsRoot32BitConstants(9, 4, debugConsts, 0);
+
 		// b2 light
 		D3D12_GPU_VIRTUAL_ADDRESS lightCBAddress =
 			lightCB->GetGPUVirtualAddress() + light.LightCBIndex * lightCBByteSize;
@@ -2971,7 +3546,10 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 			shadowSrv.Offset((INT)light.ShadowMapSrvHeapIndex, mCbvSrvDescriptorSize);
 
 			CD3DX12_GPU_DESCRIPTOR_HANDLE patternSrv(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-			patternSrv.Offset((INT)TexOffsets["textures/pattern"], mCbvSrvDescriptorSize);
+			if (useDxrThisLight)
+				patternSrv.Offset((INT)mDxrShadowMaskSrvIndex, mCbvSrvDescriptorSize); // t4 = DXR shadow mask
+			else
+				patternSrv.Offset((INT)TexOffsets["textures/pattern"], mCbvSrvDescriptorSize); // t4 = pattern
 
 			mCommandList->SetGraphicsRootDescriptorTable(6, shadowSrv);
 			mCommandList->SetGraphicsRootDescriptorTable(7, patternSrv);
@@ -3001,9 +3579,6 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 		//copy depth -> depthHistory[write]
 		Transition(mDepthStencilBuffer.Get(), mDepthState, D3D12_RESOURCE_STATE_COPY_SOURCE);
 
-		if (mTaaDepthHistState[writeIdx] == D3D12_RESOURCE_STATE_GENERIC_READ)
-			mTaaDepthHistState[writeIdx] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
 		Transition(mTaaDepthHistory[writeIdx].Get(), mTaaDepthHistState[writeIdx], D3D12_RESOURCE_STATE_COPY_DEST);
 
 		mCommandList->CopyResource(mTaaDepthHistory[writeIdx].Get(), mDepthStencilBuffer.Get());
@@ -3015,10 +3590,6 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 		Transition(mTaaHistory[writeIdx].Get(), mTaaHistState[writeIdx], D3D12_RESOURCE_STATE_RENDER_TARGET);
 
 		Transition(mTaaHistory[readIdx].Get(), mTaaHistState[readIdx], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-
-		if (mTaaDepthHistState[readIdx] == D3D12_RESOURCE_STATE_GENERIC_READ)
-			mTaaDepthHistState[readIdx] = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-
 
 		Transition(mTaaDepthHistory[readIdx].Get(), mTaaDepthHistState[readIdx], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 		Transition(mSceneTexture.Get(), mSceneState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -3092,7 +3663,17 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
 	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
 
-	ThrowIfFailed(mSwapChain->Present(0, 0));
+	{
+		HRESULT hr = mSwapChain->Present(0, 0);
+		if (FAILED(hr))
+		{
+			HRESULT dr = (md3dDevice ? md3dDevice->GetDeviceRemovedReason() : E_FAIL);
+			std::string msg = "Present failed. hr=" + d3dUtil::ToString(hr) +
+				" removedReason=" + d3dUtil::ToString(dr) + "\n";
+			OutputDebugStringA(msg.c_str());
+			ThrowIfFailed(hr);
+		}
+	}
 	mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
 
 	mCurrFrameResource->Fence = ++mCurrentFence;
@@ -3136,6 +3717,487 @@ void TexColumnsApp::DrawRenderItems(ID3D12GraphicsCommandList* cmdList, const st
 
 		cmdList->DrawIndexedInstanced(ri->IndexCount, 1, ri->StartIndexLocation, ri->BaseVertexLocation, 0);
 	}
+}
+
+void TexColumnsApp::DrawTerrain(ID3D12GraphicsCommandList* cmdList)
+{
+	if (!mTerrainEnabled || !mTerrain || mTerrain->GetVisibleTiles().empty()) return;
+	auto* geo = mGeometries["terrainGrid"].get();
+	if (!geo) return;
+	const auto& drawArg = geo->DrawArgs["terrain"];
+	UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
+	UINT matCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
+	const UINT terrainObjCBIndex = (UINT)mAllRitems.size();
+	auto objectCB = mCurrFrameResource->ObjectCB.get();
+	auto matCB = mCurrFrameResource->MaterialCB->Resource();
+	Material* terrainMat = mMaterials["TerrainMat"].get();
+	if (!terrainMat || mTerrainMaterialIndex < 0) return;
+
+	auto psoName = mTerrainWireframe ? "terrain_wireframe" : "terrain";
+	auto it = mPSOs.find(psoName);
+	if (it == mPSOs.end()) it = mPSOs.find("terrain");
+	if (it == mPSOs.end() || !it->second) return;
+	cmdList->SetPipelineState(it->second.Get());
+	cmdList->IASetVertexBuffers(0, 1, &geo->VertexBufferView());
+	cmdList->IASetIndexBuffer(&geo->IndexBufferView());
+	cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+	for (const TerrainTile& tile : mTerrain->GetVisibleTiles())
+	{
+		int srvIndex = (tile.HeightmapSrvIndex >= 0) ? tile.HeightmapSrvIndex : mTerrainFallbackHeightmapIndex;
+		if (srvIndex < 0) continue;
+		ObjectConstants objConstants;
+		objConstants.World = tile.World;
+		objConstants.PrevWorld = tile.PrevWorld;
+		objConstants.TexTransform = MathHelper::Identity4x4();
+		XMMATRIX world = XMLoadFloat4x4(&tile.World);
+		XMVECTOR det;
+		XMStoreFloat4x4(&objConstants.InvWorld, XMMatrixInverse(&det, world));
+		objectCB->CopyData(terrainObjCBIndex, objConstants);
+
+		CD3DX12_GPU_DESCRIPTOR_HANDLE heightmapHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		heightmapHandle.Offset(srvIndex, mCbvSrvDescriptorSize);
+		cmdList->SetGraphicsRootDescriptorTable(0, heightmapHandle);
+		CD3DX12_GPU_DESCRIPTOR_HANDLE diffuseHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		diffuseHandle.Offset(terrainMat->DiffuseSrvHeapIndex, mCbvSrvDescriptorSize);
+		cmdList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
+
+		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = mCurrFrameResource->ObjectCB->Resource()->GetGPUVirtualAddress() + terrainObjCBIndex * objCBByteSize;
+		D3D12_GPU_VIRTUAL_ADDRESS matCBAddress = matCB->GetGPUVirtualAddress() + mTerrainMaterialIndex * matCBByteSize;
+		cmdList->SetGraphicsRootConstantBufferView(2, objCBAddress);
+		cmdList->SetGraphicsRootConstantBufferView(4, matCBAddress);
+
+		cmdList->DrawIndexedInstanced(drawArg.IndexCount, 1, drawArg.StartIndexLocation, drawArg.BaseVertexLocation, 0);
+	}
+}
+
+void TexColumnsApp::CreateDxrShadowMaskResources()
+{
+	if (!mEnableDxrShadows) return;
+
+	// Create (or recreate) shadow mask texture (R16_FLOAT UAV/SRV).
+	mDxrShadowMask.Reset();
+
+	const UINT s = (UINT)((mDxrShadowDownscale <= 1) ? 1 : (mDxrShadowDownscale <= 2) ? 2 : 4);
+	const UINT maskW = (mClientWidth + s - 1) / s;
+	const UINT maskH = (mClientHeight + s - 1) / s;
+
+	D3D12_RESOURCE_DESC texDesc = CD3DX12_RESOURCE_DESC::Tex2D(
+		DXGI_FORMAT_R16_FLOAT,
+		(UINT64)maskW,
+		(UINT)maskH,
+		1, 1, 1, 0,
+		D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		nullptr,
+		IID_PPV_ARGS(&mDxrShadowMask)));
+
+	mDxrShadowMaskState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	mDxrShadowMask->SetName(L"DXR Shadow Mask");
+}
+
+void TexColumnsApp::CreateDxrShadowDescriptors()
+{
+	if (!mEnableDxrShadows || mSrvDescriptorHeap == nullptr) return;
+	if (mDxrTlasSrvIndex < 0 || mDxrShadowMaskUavIndex < 0 || mDxrShadowMaskSrvIndex < 0) return;
+
+	auto cpuAt = [&](int idx)
+		{
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart());
+			h.Offset(idx, mCbvSrvDescriptorSize);
+			return h;
+		};
+
+	// TLAS SRV (special: pass nullptr resource)
+	if (mDxrTlas)
+	{
+		D3D12_SHADER_RESOURCE_VIEW_DESC tlasDesc = {};
+		tlasDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		tlasDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+		tlasDesc.RaytracingAccelerationStructure.Location = mDxrTlas->GetGPUVirtualAddress();
+		md3dDevice->CreateShaderResourceView(nullptr, &tlasDesc, cpuAt(mDxrTlasSrvIndex));
+	}
+
+	// Shadow mask UAV + SRV
+	if (mDxrShadowMask)
+	{
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+		uav.Format = DXGI_FORMAT_R16_FLOAT;
+		uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		uav.Texture2D.MipSlice = 0;
+		md3dDevice->CreateUnorderedAccessView(mDxrShadowMask.Get(), nullptr, &uav, cpuAt(mDxrShadowMaskUavIndex));
+
+		D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+		srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		srv.Format = DXGI_FORMAT_R16_FLOAT;
+		srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv.Texture2D.MostDetailedMip = 0;
+		srv.Texture2D.MipLevels = 1;
+		srv.Texture2D.ResourceMinLODClamp = 0.0f;
+		md3dDevice->CreateShaderResourceView(mDxrShadowMask.Get(), &srv, cpuAt(mDxrShadowMaskSrvIndex));
+	}
+}
+
+void TexColumnsApp::BuildDxrAccelerationStructures()
+{
+	if (!mEnableDxrShadows) return;
+	try
+	{
+		if (mOpaqueRitems.empty()) return;
+
+		ComPtr<ID3D12Device5> device5;
+		if (FAILED(md3dDevice.As(&device5)))
+		{
+			mEnableDxrShadows = false;
+			return;
+		}
+		ComPtr<ID3D12GraphicsCommandList4> cmd4;
+		ThrowIfFailed(mCommandList.As(&cmd4));
+
+	// Cache BLAS per unique (Geo + submesh range).
+	struct BlasKey
+	{
+		MeshGeometry* Geo = nullptr;
+		UINT IndexCount = 0;
+		UINT StartIndexLocation = 0;
+		INT BaseVertexLocation = 0;
+	};
+	struct BlasKeyHash
+	{
+		size_t operator()(const BlasKey& k) const noexcept
+		{
+			size_t h = std::hash<void*>()(k.Geo);
+			auto hc = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+			hc(std::hash<UINT>()(k.IndexCount));
+			hc(std::hash<UINT>()(k.StartIndexLocation));
+			hc(std::hash<int>()(k.BaseVertexLocation));
+			return h;
+		}
+	};
+	struct BlasKeyEq
+	{
+		bool operator()(const BlasKey& a, const BlasKey& b) const noexcept
+		{
+			return a.Geo == b.Geo &&
+				a.IndexCount == b.IndexCount &&
+				a.StartIndexLocation == b.StartIndexLocation &&
+				a.BaseVertexLocation == b.BaseVertexLocation;
+		}
+	};
+
+	std::unordered_map<BlasKey, UINT, BlasKeyHash, BlasKeyEq> blasIndex;
+	struct BlasBuild
+	{
+		BlasKey Key;
+		D3D12_RAYTRACING_GEOMETRY_DESC Geom = {};
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS Inputs = {};
+		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO Info = {};
+	};
+	std::vector<BlasBuild> builds;
+	builds.reserve(mOpaqueRitems.size());
+
+	UINT64 maxScratch = 0;
+	for (auto ri : mOpaqueRitems)
+	{
+		if (!ri || !ri->Geo || !ri->Geo->VertexBufferGPU || !ri->Geo->IndexBufferGPU)
+			continue;
+
+		BlasKey key;
+		key.Geo = ri->Geo;
+		key.IndexCount = ri->IndexCount;
+		key.StartIndexLocation = ri->StartIndexLocation;
+		key.BaseVertexLocation = ri->BaseVertexLocation;
+
+		if (blasIndex.find(key) != blasIndex.end())
+			continue;
+
+		BlasBuild b;
+		b.Key = key;
+
+		const UINT stride = sizeof(Vertex);
+		const UINT totalVerts = (UINT)(key.Geo->VertexBufferByteSize / stride);
+		const UINT vertsFromBase = (totalVerts > (UINT)max(0, key.BaseVertexLocation)) ? (totalVerts - (UINT)key.BaseVertexLocation) : totalVerts;
+
+		b.Geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+		b.Geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+		b.Geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+		b.Geom.Triangles.VertexCount = vertsFromBase;
+		b.Geom.Triangles.VertexBuffer.StartAddress =
+			key.Geo->VertexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.BaseVertexLocation * stride;
+		b.Geom.Triangles.VertexBuffer.StrideInBytes = stride;
+
+		const DXGI_FORMAT idxFmt = key.Geo->IndexFormat;
+		const UINT idxStride = (idxFmt == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+		b.Geom.Triangles.IndexFormat = idxFmt;
+		b.Geom.Triangles.IndexCount = key.IndexCount;
+		b.Geom.Triangles.IndexBuffer =
+			key.Geo->IndexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.StartIndexLocation * idxStride;
+		b.Geom.Triangles.Transform3x4 = 0;
+
+		b.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+		b.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+		b.Inputs.NumDescs = 1;
+		b.Inputs.pGeometryDescs = &b.Geom;
+		b.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+		device5->GetRaytracingAccelerationStructurePrebuildInfo(&b.Inputs, &b.Info);
+		maxScratch = max(maxScratch, b.Info.ScratchDataSizeInBytes);
+
+		UINT idx = (UINT)builds.size();
+		blasIndex[key] = idx;
+		builds.push_back(std::move(b));
+		// Fix pointer after move: Inputs.pGeometryDescs must point to the element's own Geom.
+		builds[idx].Inputs.pGeometryDescs = &builds[idx].Geom;
+	}
+
+	if (builds.empty())
+	{
+		mEnableDxrShadows = false;
+		return;
+	}
+
+	// Scratch for BLAS builds (reused).
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(maxScratch, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		nullptr,
+		IID_PPV_ARGS(&mDxrBlasScratch)));
+
+	mDxrBlas.clear();
+	mDxrBlas.resize(builds.size());
+
+	for (UINT i = 0; i < (UINT)builds.size(); ++i)
+	{
+		UINT64 resultSize = builds[i].Info.ResultDataMaxSizeInBytes;
+		ThrowIfFailed(md3dDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(resultSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+			D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+			nullptr,
+			IID_PPV_ARGS(&mDxrBlas[i])));
+
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+		desc.Inputs = builds[i].Inputs;
+		desc.DestAccelerationStructureData = mDxrBlas[i]->GetGPUVirtualAddress();
+		desc.ScratchAccelerationStructureData = mDxrBlasScratch->GetGPUVirtualAddress();
+		cmd4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrBlas[i].Get()));
+	}
+
+	// TLAS instances (one per opaque render item, stable order).
+	mDxrInstances.clear();
+	mDxrInstances.reserve(mOpaqueRitems.size());
+	for (auto ri : mOpaqueRitems)
+	{
+		if (!ri || !ri->Geo) continue;
+
+		BlasKey key;
+		key.Geo = ri->Geo;
+		key.IndexCount = ri->IndexCount;
+		key.StartIndexLocation = ri->StartIndexLocation;
+		key.BaseVertexLocation = ri->BaseVertexLocation;
+
+		auto it = blasIndex.find(key);
+		if (it == blasIndex.end()) continue;
+
+		mDxrInstances.push_back({ ri, it->second });
+	}
+
+	const UINT instanceCount = (UINT)mDxrInstances.size();
+	if (instanceCount == 0)
+	{
+		mEnableDxrShadows = false;
+		return;
+	}
+
+	const UINT64 instanceBufferSize = (UINT64)instanceCount * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+
+	// Per-frame instance buffers to avoid CPU/GPU races when updating transforms.
+	mDxrInstanceDescs.clear();
+	mDxrInstanceDescs.resize((size_t)gNumFrameResources);
+	for (int fi = 0; fi < gNumFrameResources; ++fi)
+	{
+		ThrowIfFailed(md3dDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(instanceBufferSize),
+			D3D12_RESOURCE_STATE_GENERIC_READ,
+			nullptr,
+			IID_PPV_ARGS(&mDxrInstanceDescs[fi])));
+
+		D3D12_RAYTRACING_INSTANCE_DESC* mapped = nullptr;
+		ThrowIfFailed(mDxrInstanceDescs[fi]->Map(0, nullptr, (void**)&mapped));
+
+		for (UINT i = 0; i < instanceCount; ++i)
+		{
+			RenderItem* ri = mDxrInstances[i].Ri;
+			const UINT blasIdx = mDxrInstances[i].BlasIndex;
+			D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
+			memset(&inst, 0, sizeof(inst));
+			inst.InstanceID = i;
+			inst.InstanceContributionToHitGroupIndex = 0;
+			inst.InstanceMask = 0xFF;
+			inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+
+			// Row-major 3x4 transform from RenderItem world matrix.
+			const XMFLOAT4X4& W = ri->World;
+			for (int r = 0; r < 3; ++r)
+				for (int c = 0; c < 4; ++c)
+					inst.Transform[r][c] = W.m[r][c];
+
+			inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
+		}
+		mDxrInstanceDescs[fi]->Unmap(0, nullptr);
+	}
+
+	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
+	tlasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+	tlasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+	tlasInputs.NumDescs = instanceCount;
+	tlasInputs.InstanceDescs = mDxrInstanceDescs.empty() ? 0 : mDxrInstanceDescs[0]->GetGPUVirtualAddress();
+	tlasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+
+	D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlasInfo = {};
+	device5->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &tlasInfo);
+
+	const UINT64 tlasScratchSize = max(tlasInfo.ScratchDataSizeInBytes, tlasInfo.UpdateScratchDataSizeInBytes);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(tlasScratchSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		nullptr,
+		IID_PPV_ARGS(&mDxrTlasScratch)));
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(tlasInfo.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+		D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+		nullptr,
+		IID_PPV_ARGS(&mDxrTlas)));
+
+	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlasDesc = {};
+	tlasDesc.Inputs = tlasInputs;
+	tlasDesc.DestAccelerationStructureData = mDxrTlas->GetGPUVirtualAddress();
+	tlasDesc.ScratchAccelerationStructureData = mDxrTlasScratch->GetGPUVirtualAddress();
+	cmd4->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
+		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrTlas.Get()));
+	}
+	catch (const DxException&)
+	{
+		// Fail gracefully: keep app running with shadow maps.
+		mEnableDxrShadows = false;
+		mDxrBlasScratch.Reset();
+		mDxrTlasScratch.Reset();
+		mDxrTlas.Reset();
+		mDxrInstanceDescs.clear();
+		mDxrBlas.clear();
+		mDxrInstances.clear();
+	}
+}
+
+void TexColumnsApp::DispatchDxrShadowMask(ID3D12GraphicsCommandList* cmdList)
+{
+	if (!mEnableDxrShadows) return;
+	if (!mDxrShadowRootSignature || !mDxrShadowPSO || !mDxrShadowMask || !mDxrTlas || !mDxrShadowCB) return;
+	if (!cmdList) return;
+
+	// Update TLAS every frame to match animated/moving render items.
+	if (mDxrUpdateTlasEveryFrame && !mDxrInstances.empty() && !mDxrInstanceDescs.empty() && mDxrTlasScratch && mDxrTlas)
+	{
+		ComPtr<ID3D12GraphicsCommandList4> cmd4;
+		if (SUCCEEDED(cmdList->QueryInterface(IID_PPV_ARGS(&cmd4))))
+		{
+			int fi = std::clamp(mCurrFrameResourceIndex, 0, gNumFrameResources - 1);
+			auto& instBuf = mDxrInstanceDescs[(size_t)fi];
+			if (!instBuf) return;
+
+			D3D12_RAYTRACING_INSTANCE_DESC* mapped = nullptr;
+			if (SUCCEEDED(instBuf->Map(0, nullptr, (void**)&mapped)))
+			{
+				for (UINT i = 0; i < (UINT)mDxrInstances.size(); ++i)
+				{
+					RenderItem* ri = mDxrInstances[i].Ri;
+					const UINT blasIdx = mDxrInstances[i].BlasIndex;
+					D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
+
+					// Update transform only.
+					const XMFLOAT4X4& W = ri->World;
+					for (int r = 0; r < 3; ++r)
+						for (int c = 0; c < 4; ++c)
+							inst.Transform[r][c] = W.m[r][c];
+
+					inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
+				}
+				instBuf->Unmap(0, nullptr);
+			}
+
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs = {};
+			inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			inputs.NumDescs = (UINT)mDxrInstances.size();
+			inputs.InstanceDescs = instBuf->GetGPUVirtualAddress();
+			inputs.Flags =
+				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE |
+				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+			desc.Inputs = inputs;
+			desc.SourceAccelerationStructureData = mDxrTlas->GetGPUVirtualAddress();
+			desc.DestAccelerationStructureData = mDxrTlas->GetGPUVirtualAddress();
+			desc.ScratchAccelerationStructureData = mDxrTlasScratch->GetGPUVirtualAddress();
+			cmd4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+			cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrTlas.Get()));
+		}
+	}
+
+	// Ensure output is UAV.
+	Transition(mDxrShadowMask.Get(), mDxrShadowMaskState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+	cmdList->SetComputeRootSignature(mDxrShadowRootSignature.Get());
+	cmdList->SetPipelineState(mDxrShadowPSO.Get());
+
+	// Descriptor heap already set in DeferredDraw (mSrvDescriptorHeap).
+	auto gpuAt = [&](int idx)
+		{
+			CD3DX12_GPU_DESCRIPTOR_HANDLE h(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+			h.Offset(idx, mCbvSrvDescriptorSize);
+			return h;
+		};
+
+	// t0 = TLAS
+	cmdList->SetComputeRootDescriptorTable(0, gpuAt(mDxrTlasSrvIndex));
+	// t1 = Position
+	cmdList->SetComputeRootDescriptorTable(1, gpuAt(mGBufferSrvIndexPosition));
+	// t2 = Normal
+	cmdList->SetComputeRootDescriptorTable(2, gpuAt(mGBufferSrvIndexNormal));
+	// u0 = Shadow mask UAV
+	cmdList->SetComputeRootDescriptorTable(3, gpuAt(mDxrShadowMaskUavIndex));
+
+	// b0 = constants (per-frame)
+	UINT cbByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(DxrShadowConstants));
+	D3D12_GPU_VIRTUAL_ADDRESS cbAddr = mDxrShadowCB->Resource()->GetGPUVirtualAddress() + (UINT64)mCurrFrameResourceIndex * cbByteSize;
+	cmdList->SetComputeRootConstantBufferView(4, cbAddr);
+
+	auto md = mDxrShadowMask->GetDesc();
+	const UINT maskW = (UINT)md.Width;
+	const UINT maskH = (UINT)md.Height;
+	const UINT gx = (maskW + 7) / 8;
+	const UINT gy = (maskH + 7) / 8;
+	cmdList->Dispatch(gx, gy, 1);
+
+	// Make readable for lighting (t4 SRV).
+	Transition(mDxrShadowMask.Get(), mDxrShadowMaskState, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
 std::array<const CD3DX12_STATIC_SAMPLER_DESC, 7> TexColumnsApp::GetStaticSamplers()

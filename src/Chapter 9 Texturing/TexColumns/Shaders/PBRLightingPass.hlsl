@@ -76,9 +76,11 @@ cbuffer cbLight : register(b2)
 
 cbuffer cbDebug : register(b3)
 {
-    // 0=Off, 1=Moving objects (CPU), 2=Velocity buffer, 3=Velocity buffer object-only (approx)
-    uint gVelocityDebugMode;
-    float3 _padDebug;
+    // Root constants (4x32-bit): keep in sync with BuildLightingRootSignature (root param 9)
+    uint gVelocityDebugMode;        // 0..3
+    uint gUseDxrShadows;            // 0/1: if 1 and light.ShadowMode==1, read DXR shadow mask from t4
+    uint gVisualizeDxrShadowMask;   // 0/1: output shadow mask as grayscale
+    uint _padDebug;
 };
 
 cbuffer cbAtmosphere : register(b4)
@@ -292,16 +294,40 @@ float3 ComputeSunDisc(float3 viewDir, float3 sunDir, float radius, float intensi
     return sunColor * intensity * disc;
 }
 
-float ComputeShadowFactor(float3 posW)
+// Poisson disk (unit circle); 12 samples for soft shadows (TAA will filter noise)
+static const float2 kPoissonDisk12[12] = {
+    float2(-0.326,-0.406), float2(-0.840,-0.074), float2(-0.696, 0.457),
+    float2(-0.203, 0.621), float2( 0.962,-0.195), float2( 0.473,-0.480),
+    float2( 0.519, 0.767), float2( 0.185,-0.893), float2( 0.507, 0.064),
+    float2( 0.896, 0.412), float2(-0.322,-0.933), float2(-0.792,-0.598)
+};
+
+// Hash for per-pixel, per-frame rotation (TAA-friendly jitter)
+float Hash21(float2 p)
 {
-    // Only directional/spot lights can cast shadows here.
+    // Tie shadow jitter to the TAA jitter sequence so it changes once per frame in a stable way.
+    float2 j = gCurrJitterUV * 16384.0f;
+    return frac(sin(dot(p + j, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float ComputeShadowFactor(float3 posW, float2 pixelPos)
+{
+    // DXR shadow mask path: the mask is written by a RayQuery compute pass into t4 (gShadowTexture).
+    if (gUseDxrShadows != 0 && light.CastsShadows)
+    {
+        // Sample by UV so shadow mask can be lower resolution than the main render target.
+        float2 uv = pixelPos * gInvRenderTargetSize;
+        return gShadowTexture.SampleLevel(gsamLinearClamp, uv, 0).r;
+    }
+
     if (!light.CastsShadows)
         return 1.0f;
-
     if (!(light.type == 2 || light.type == 3))
         return 1.0f;
 
-    float2 texelSize = 1.0f / float2(2048, 2048); // TODO: make constant
+    uint shadowW, shadowH;
+    gShadowMap.GetDimensions(shadowW, shadowH);
+    float2 texelSize = 1.0f / max(float2(shadowW, shadowH), 1.0f);
 
     float4 shadowPosH = mul(float4(posW, 1.0f), light.LightViewProj);
     shadowPosH.xyz /= max(shadowPosH.w, 1e-6f);
@@ -310,26 +336,47 @@ float ComputeShadowFactor(float3 posW)
     shadowTexC.x = 0.5f * shadowPosH.x + 0.5f;
     shadowTexC.y = -0.5f * shadowPosH.y + 0.5f;
 
-    const float shadowBias = 0.001f;
+    const float shadowBias = 0.0015f;
 
     float shadowFactor = 1.0f;
     if ((saturate(shadowTexC.x) == shadowTexC.x) && (saturate(shadowTexC.y) == shadowTexC.y) &&
         (shadowPosH.z > 0.0f) && (shadowPosH.z < 1.0f))
     {
-        shadowFactor = gShadowMap.SampleCmpLevelZero(gsamShadow, shadowTexC, shadowPosH.z - shadowBias);
+        float softness = max(light.ShadowSoftness, 0.0f);
 
-        if (light.enablePCF)
+        if (softness > 0.0f)
+        {
+            // Soft shadows: poisson disk + random rotation; cone radius = softness (texels). TAA filters the noise.
+            float angle = Hash21(pixelPos) * 6.28318530718;
+            float s = sin(angle), c = cos(angle);
+            float2 radius = softness * texelSize;
+            float totalFactor = 0.0f;
+            for (int i = 0; i < 12; i++)
+            {
+                float2 poisson = kPoissonDisk12[i];
+                float2 offset = float2(poisson.x * c - poisson.y * s, poisson.x * s + poisson.y * c) * radius;
+                totalFactor += gShadowMap.SampleCmpLevelZero(gsamShadow, shadowTexC + offset, shadowPosH.z - shadowBias);
+            }
+            shadowFactor = totalFactor / 12.0f;
+        }
+        else if (light.enablePCF)
         {
             float totalFactor = 0.0f;
-            for (float y = -light.pcf_level; y <= light.pcf_level; y += 1.0f)
+            int level = max(light.pcf_level, 0);
+            for (int y = -level; y <= level; y++)
             {
-                for (float x = -light.pcf_level; x <= light.pcf_level; x += 1.0f)
+                for (int x = -level; x <= level; x++)
                 {
                     float2 offset = float2(x, y) * texelSize;
                     totalFactor += gShadowMap.SampleCmpLevelZero(gsamShadow, shadowTexC + offset, shadowPosH.z - shadowBias);
                 }
             }
-            shadowFactor = totalFactor / ((light.pcf_level * 2 + 1) * (light.pcf_level * 2 + 1));
+            int n = (level * 2 + 1) * (level * 2 + 1);
+            shadowFactor = totalFactor / max(n, 1);
+        }
+        else
+        {
+            shadowFactor = gShadowMap.SampleCmpLevelZero(gsamShadow, shadowTexC, shadowPosH.z - shadowBias);
         }
     }
 
@@ -417,7 +464,9 @@ float4 PS(VSOut pin) : SV_TARGET
 
     float3 F0 = lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
 
-    float shadowFactor = ComputeShadowFactor(posW);
+    float shadowFactor = ComputeShadowFactor(posW, pin.PosH.xy);
+    if (gVisualizeDxrShadowMask != 0)
+        return float4(shadowFactor.xxx, 1.0f);
 
     // Ambient / IBL pass (computed once).
     if (light.type == 0)
