@@ -315,9 +315,14 @@ float ComputeShadowFactor(float3 posW, float2 pixelPos)
     // DXR shadow mask path: the mask is written by a RayQuery compute pass into t4 (gShadowTexture).
     if (gUseDxrShadows != 0 && light.CastsShadows)
     {
-        // Sample by UV so shadow mask can be lower resolution than the main render target.
-        float2 uv = pixelPos * gInvRenderTargetSize;
-        return gShadowTexture.SampleLevel(gsamLinearClamp, uv, 0).r;
+        // Map full-res pixel -> shadow mask texel and load (stable, avoids bilinear "shifts").
+        uint mw, mh;
+        gShadowTexture.GetDimensions(mw, mh);
+
+        float2 uv = pixelPos * gInvRenderTargetSize; // 0..1
+        int2 p = int2(uv * float2((float)mw, (float)mh));
+        p = clamp(p, int2(0, 0), int2((int)mw - 1, (int)mh - 1));
+        return gShadowTexture.Load(int3(p, 0)).r;
     }
 
     if (!light.CastsShadows)

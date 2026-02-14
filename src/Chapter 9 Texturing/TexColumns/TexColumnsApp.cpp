@@ -3182,8 +3182,8 @@ void TexColumnsApp::BuildRenderItems()
 	mAllRitems.push_back(std::move(shadowTestRitem));
 
 	RenderCustomMesh("building", "sponza", "", XMFLOAT3(0.07, 0.07, 0.07), XMFLOAT3(0, 3.14 / 2, 0), XMFLOAT3(0, 0, 0));
-	RenderCustomMesh("nigga", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, 3.14, 0), XMFLOAT3(0, 3, 0));
-	RenderCustomMesh("nigga2", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, -3.14 / 2, 0), XMFLOAT3(-10, 3, 30));
+	RenderCustomMesh("nigga", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, 3.14, 0), XMFLOAT3(6, 5, 0));
+	RenderCustomMesh("nigga2", "negr", "NiggaMat", XMFLOAT3(3, 3, 3), XMFLOAT3(0, -3.14 / 2, 0), XMFLOAT3(-10, 7, 30));
 
 	// PBR test spheres grid (5x5: metallic across X, roughness across Z)
 	{
@@ -4045,13 +4045,19 @@ void TexColumnsApp::BuildDxrAccelerationStructures()
 			inst.InstanceID = i;
 			inst.InstanceContributionToHitGroupIndex = 0;
 			inst.InstanceMask = 0xFF;
-			inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+			// Disable triangle culling to avoid missing occluders due to winding/one-sided meshes.
+			inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_CULL_DISABLE;
 
-			// Row-major 3x4 transform from RenderItem world matrix.
-			const XMFLOAT4X4& W = ri->World;
+			// DXR instance transform is a row-major 3x4 that expects translation in the last column.
+			// Our RenderItem::World is used with mul(pos, gWorld) in HLSL (row-vector convention),
+			// so translation lives in the last ROW. Transpose to match DXR's 3x4 layout.
+			XMMATRIX Wm = XMLoadFloat4x4(&ri->World);
+			XMMATRIX Wt = XMMatrixTranspose(Wm);
+			XMFLOAT4X4 Wtx;
+			XMStoreFloat4x4(&Wtx, Wt);
 			for (int r = 0; r < 3; ++r)
 				for (int c = 0; c < 4; ++c)
-					inst.Transform[r][c] = W.m[r][c];
+					inst.Transform[r][c] = Wtx.m[r][c];
 
 			inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
 		}
@@ -4131,11 +4137,14 @@ void TexColumnsApp::DispatchDxrShadowMask(ID3D12GraphicsCommandList* cmdList)
 					const UINT blasIdx = mDxrInstances[i].BlasIndex;
 					D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
 
-					// Update transform only.
-					const XMFLOAT4X4& W = ri->World;
+					// Update transform only (transpose for DXR 3x4 layout, see build path above).
+					XMMATRIX Wm = XMLoadFloat4x4(&ri->World);
+					XMMATRIX Wt = XMMatrixTranspose(Wm);
+					XMFLOAT4X4 Wtx;
+					XMStoreFloat4x4(&Wtx, Wt);
 					for (int r = 0; r < 3; ++r)
 						for (int c = 0; c < 4; ++c)
-							inst.Transform[r][c] = W.m[r][c];
+							inst.Transform[r][c] = Wtx.m[r][c];
 
 					inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
 				}
@@ -4147,9 +4156,11 @@ void TexColumnsApp::DispatchDxrShadowMask(ID3D12GraphicsCommandList* cmdList)
 			inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
 			inputs.NumDescs = (UINT)mDxrInstances.size();
 			inputs.InstanceDescs = instBuf->GetGPUVirtualAddress();
+			// Update must use the same "preference" flags as the initial build (except ALLOW_UPDATE -> PERFORM_UPDATE).
+			// Initial TLAS build uses PREFER_FAST_TRACE | ALLOW_UPDATE, so the update uses PREFER_FAST_TRACE | PERFORM_UPDATE.
 			inputs.Flags =
-				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE |
-				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+				D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE;
 
 			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
 			desc.Inputs = inputs;
