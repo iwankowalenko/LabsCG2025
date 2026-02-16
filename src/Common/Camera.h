@@ -100,7 +100,7 @@ private:
 
 	float CurSpeed = 0.3f;
 	float BaseSpeed = 0.3f;
-	float MaxSpeed = 0.9f;
+	float MaxSpeed = 100000.f;
 	bool mViewDirty = true;
 
 	// Cache View/Proj matrices.

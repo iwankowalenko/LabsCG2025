@@ -12,8 +12,10 @@
 #include "Terrain.h"
 #include <iostream>
 #include <algorithm> 
+#include <array>
 #include <cmath>
 #include <cctype>
+#include <unordered_set>
 #include <dxcapi.h>
 
 
@@ -218,6 +220,7 @@ private:
 	void UpdateMainPassCB(const GameTimer& gt);
 	void CreateGBuffer() override;
 	void CreateSceneTexture();
+	void UpdateImGuiViewportSrvs();
 	void LoadAllTextures();
 	void LoadTexture(const std::string& name);
 	void BuildRootSignature();
@@ -276,6 +279,13 @@ private:
 	ComPtr<ID3D12DescriptorHeap> mSrvDescriptorHeap = nullptr;
 	ComPtr<ID3D12DescriptorHeap> m_ImGuiSrvDescriptorHeap; // Member variable
 	bool mImGuiInitialized = false;
+	// GPU handles (ImGui heap) for drawing the scene/taa in ImGui::Image()
+	CD3DX12_GPU_DESCRIPTOR_HANDLE mImGuiSceneSrvHandle{};
+	CD3DX12_GPU_DESCRIPTOR_HANDLE mImGuiTaaHistorySrvHandle[2]{};
+	// Input routing for camera when scene is shown inside ImGui viewport window.
+	bool mViewportHovered = false;       // mouse is over Viewport window
+	bool mViewportImageHovered = false;  // mouse is over the Image() item
+	bool mViewportDragging = false;      // we are currently rotating camera by dragging in viewport
 
 	std::unordered_map<std::string, std::unique_ptr<MeshGeometry>> mGeometries;
 	std::unordered_map<std::string, std::unique_ptr<Material>> mMaterials;
@@ -302,7 +312,7 @@ private:
 
 	POINT mLastMousePos;
 
-	// G-Buffer ресурсы
+	// G-Buffer �������
 	ComPtr<ID3D12Resource> mGBufferPosition;
 	ComPtr<ID3D12Resource> mGBufferNormal;
 	ComPtr<ID3D12Resource> mGBufferAlbedo;
@@ -311,10 +321,10 @@ private:
 	ComPtr<ID3D12Resource> mGBufferVelocity;
 
 
-	// Дескрипторы для G-Buffer
+	// ����������� ��� G-Buffer
 	CD3DX12_CPU_DESCRIPTOR_HANDLE mGBufferRTVs[4]; // 0:Position, 1:Normal, 2:Albedo
 	CD3DX12_CPU_DESCRIPTOR_HANDLE mGBufferDSV;
-	CD3DX12_GPU_DESCRIPTOR_HANDLE mGBufferSRVs[3]; // SRV для шейдеров
+	CD3DX12_GPU_DESCRIPTOR_HANDLE mGBufferSRVs[3]; // SRV ��� ��������
 
 	UINT mGBufferRTVDescriptorSize;
 	UINT mGBufferDSVDescriptorSize;
@@ -330,11 +340,11 @@ private:
 	D3D12_VIEWPORT mShadowViewport;
 	D3D12_RECT mShadowScissorRect;
 
-	// Размеры как у окна
+	// ������� ��� � ����
 	UINT width = mClientWidth;
 	UINT height = mClientHeight;
 
-	// Форматы:
+	// �������:
 	const DXGI_FORMAT positionFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
 	const DXGI_FORMAT normalFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
 	const DXGI_FORMAT albedoFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -352,7 +362,7 @@ private:
 
 	float gChromaticAberrationOffset = 0.000f;
 
-	XMFLOAT4X4 mBaseProj = MathHelper::Identity4x4(); // projection без джиттера
+	XMFLOAT4X4 mBaseProj = MathHelper::Identity4x4(); // projection ��� ��������
 	UINT mJitterIndex = 0;
 	static const UINT kJitterCount = 8;
 	XMFLOAT2 mJitter = XMFLOAT2(0.0f, 0.0f); 
@@ -376,18 +386,21 @@ private:
 	AtmosphereConstants mAtmosphereParams;
 
 	std::unique_ptr<Terrain> mTerrain;
-	std::vector<int> mTerrainHeightmapIndicesLOD0;
-	std::vector<int> mTerrainHeightmapIndicesLOD1;
-	std::vector<int> mTerrainHeightmapIndicesLOD2;
+	std::array<std::vector<int>, kTerrainLODLevels> mTerrainHeightSrv = {};
+	std::array<std::vector<int>, kTerrainLODLevels> mTerrainDiffuseSrv = {};
+	std::array<std::vector<int>, kTerrainLODLevels> mTerrainNormalSrv = {};
 	int mTerrainMaterialIndex = -1;
-	float mTerrainHeightScale = 50.0f;
-	float mTerrainWorldSize = 100.0f;
+	float mTerrainHeightScale = 3000.0f;
+	float mTerrainWorldSize = 1024.0f;
 	float mTerrainLOD1Factor = 0.6f;
 	float mTerrainLOD2Factor = 0.3f;
 	int mTerrainFallbackHeightmapIndex = -1;
+	int mTerrainFallbackDiffuseIndex = -1;
+	int mTerrainFallbackNormalIndex = -1;
 	bool mTerrainEnabled = true;
 	bool mTerrainWireframe = false;
 	float mTerrainOriginY = 125.0f;  // above PBR spheres (y=120)
+	float mTerrainSkirtDepth = 5.0f;
 
 	// ---------------- DXR (RayQuery) shadows ----------------
 	bool mEnableDxrShadows = true;
@@ -459,7 +472,7 @@ private:
 	int mGBufferSrvIndexAlbedo = -1;
 	int mGBufferSrvIndexNormal = -1;
 	int mGBufferSrvIndexPosition = -1;
-	int mGBufferSrvIndexVelocity = -1; // пригодится дальше
+	int mGBufferSrvIndexVelocity = -1; // ���������� ������
 
 	DirectX::XMFLOAT4X4 mPrevViewProjNoJitter = MathHelper::Identity4x4();
 
@@ -555,10 +568,10 @@ void TexColumnsApp::MoveUpDown(float step) {
 
 bool TexColumnsApp::Initialize()
 {
-	// Создаем консольное окно.
+	// ������� ���������� ����.
 	AllocConsole();
 
-	// Перенаправляем стандартные потоки.
+	// �������������� ����������� ������.
 	freopen("CONIN$", "r", stdin);
 	freopen("CONOUT$", "w", stdout);
 	freopen("CONOUT$", "w", stderr);
@@ -603,11 +616,13 @@ bool TexColumnsApp::Initialize()
 	mTerrain->SetOriginY(mTerrainOriginY);
 	mTerrain->SetLODDistances(mTerrainWorldSize * mTerrainLOD1Factor, mTerrainWorldSize * mTerrainLOD2Factor);
 	mTerrain->BuildQuadtree();
-	mTerrain->AssignHeightmapIndices(mTerrainHeightmapIndicesLOD0, mTerrainHeightmapIndicesLOD1, mTerrainHeightmapIndicesLOD2);
+	mTerrain->AssignTileSrvIndices(mTerrainHeightSrv, mTerrainDiffuseSrv, mTerrainNormalSrv);
 	BuildFrameResources();
 
 	D3D12_DESCRIPTOR_HEAP_DESC imGuiHeapDesc = {};
-	imGuiHeapDesc.NumDescriptors = 1;
+	// [0] reserved for ImGui font texture SRV (created by backend init).
+	// [1..] reserved for application textures to show in ImGui (viewport, etc).
+	imGuiHeapDesc.NumDescriptors = 8;
 	imGuiHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
 	imGuiHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 	imGuiHeapDesc.NodeMask = 0; // Or the appropriate node mask if you have multiple GPUs
@@ -621,6 +636,7 @@ bool TexColumnsApp::Initialize()
 	ImGuiIO& io = ImGui::GetIO();
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
 	io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;         // Enable Docking (dock/undock windows, tab bars, etc.)
 
 	ImGui_ImplDX12_InitInfo init_info = {};
 	init_info.Device = md3dDevice.Get();
@@ -628,12 +644,17 @@ bool TexColumnsApp::Initialize()
 	init_info.NumFramesInFlight = gNumFrameResources;
 	init_info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM; 
 	init_info.DSVFormat = DXGI_FORMAT_UNKNOWN;
-	init_info.SrvDescriptorHeap = mSrvDescriptorHeap.Get();
-	init_info.LegacySingleSrvCpuDescriptor = mSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
-	init_info.LegacySingleSrvGpuDescriptor = mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+	// Important: keep ImGui SRV descriptors in a dedicated heap.
+	// BuildDescriptorHeaps() is called from OnResize() and repopulates mSrvDescriptorHeap from slot 0,
+	// which would overwrite the ImGui font SRV if we used the same heap.
+	init_info.SrvDescriptorHeap = m_ImGuiSrvDescriptorHeap.Get();
+	init_info.LegacySingleSrvCpuDescriptor = m_ImGuiSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+	init_info.LegacySingleSrvGpuDescriptor = m_ImGuiSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
 	ImGui_ImplWin32_Init(mhMainWnd);
 	ImGui_ImplDX12_Init(&init_info);
 	mImGuiInitialized = true;
+	// Create SRVs for the scene textures inside ImGui heap (do it after backend init so font SRV is created first).
+	UpdateImGuiViewportSrvs();
 	// Execute the initialization commands.
 	ThrowIfFailed(mCommandList->Close());
 	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
@@ -690,6 +711,57 @@ void TexColumnsApp::CreateSceneTexture()
 	md3dDevice->CreateRenderTargetView(mSceneTexture.Get(), &rtvDesc, mSceneRtvHandle);
 }
 
+void TexColumnsApp::UpdateImGuiViewportSrvs()
+{
+	// We store app SRVs in the dedicated ImGui heap:
+	// [0] ImGui font SRV (owned by backend)
+	// [1] Scene texture SRV
+	// [2] TAA history 0 SRV
+	// [3] TAA history 1 SRV
+	if (!m_ImGuiSrvDescriptorHeap || mCbvSrvDescriptorSize == 0)
+		return;
+
+	auto cpuBase = m_ImGuiSrvDescriptorHeap->GetCPUDescriptorHandleForHeapStart();
+	auto gpuBase = m_ImGuiSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart();
+
+	auto cpuAt = [&](UINT idx)
+		{
+			CD3DX12_CPU_DESCRIPTOR_HANDLE h(cpuBase);
+			h.Offset((INT)idx, mCbvSrvDescriptorSize);
+			return h;
+		};
+
+	auto gpuAt = [&](UINT idx)
+		{
+			CD3DX12_GPU_DESCRIPTOR_HANDLE h(gpuBase);
+			h.Offset((INT)idx, mCbvSrvDescriptorSize);
+			return h;
+		};
+
+	auto createSrv2D = [&](ID3D12Resource* res, UINT idx)
+		{
+			if (!res) return;
+			auto d = res->GetDesc();
+			D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+			srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+			srvDesc.Format = d.Format;
+			srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+			srvDesc.Texture2D.MostDetailedMip = 0;
+			srvDesc.Texture2D.MipLevels = 1;
+			srvDesc.Texture2D.ResourceMinLODClamp = 0.0f;
+			md3dDevice->CreateShaderResourceView(res, &srvDesc, cpuAt(idx));
+		};
+
+	createSrv2D(mSceneTexture.Get(), 1);
+	mImGuiSceneSrvHandle = gpuAt(1);
+
+	createSrv2D(mTaaHistory[0].Get(), 2);
+	mImGuiTaaHistorySrvHandle[0] = gpuAt(2);
+
+	createSrv2D(mTaaHistory[1].Get(), 3);
+	mImGuiTaaHistorySrvHandle[1] = gpuAt(3);
+}
+
 
 void TexColumnsApp::OnResize()
 {
@@ -700,19 +772,24 @@ void TexColumnsApp::OnResize()
 	OutputDebugStringA(("gbuf3=" + std::to_string((uint64_t)p) + " scene=" + std::to_string((uint64_t)s) + "\n").c_str());
 
 	CreateSceneTexture();
-	CreateTaaHistoryTextures();   // <-- history ресурсы
-	CreateTaaHistoryRtvs();       // <-- RTV для history 
+	CreateTaaHistoryTextures();   // <-- history �������
+	CreateTaaHistoryRtvs();       // <-- RTV ��� history 
 	CreateTaaDepthHistoryTextures();
 	BuildDescriptorHeaps();
 	CreateDxrShadowMaskResources();
 	CreateDxrShadowDescriptors();
 
-	XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f * MathHelper::Pi, AspectRatio(), 1.0f, 1000.0f);
+	// Increase far plane so terrain and distant objects don't clip.
+	XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f * MathHelper::Pi, AspectRatio(), 1.0f, 5000.0f);
 
 	XMStoreFloat4x4(&mBaseProj, P);
 	XMStoreFloat4x4(&mProj, P); 
 
 	mJitterIndex = 0; 
+
+	// Recreate SRVs to the newly recreated textures so the ImGui viewport keeps working after resize.
+	if (mImGuiInitialized)
+		UpdateImGuiViewportSrvs();
 }
 
 void TexColumnsApp::Update(const GameTimer& gt)
@@ -736,6 +813,71 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	ImGui_ImplDX12_NewFrame();
 	ImGui_ImplWin32_NewFrame();
 	ImGui::NewFrame();
+
+	// Global DockSpace (must be submitted before dockable windows)
+	// This enables convenient window management: docking, tabbing, splitting, etc.
+	{
+		ImGuiDockNodeFlags dockspace_flags = ImGuiDockNodeFlags_PassthruCentralNode;
+		ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport(), dockspace_flags);
+	}
+
+	// Viewport window: show the rendered scene texture as an image.
+	// If the window size/aspect doesn't match the texture, crop from edges and show the central part.
+	{
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+		ImGui::Begin("Viewport");
+
+		ImVec2 avail = ImGui::GetContentRegionAvail();
+		mViewportHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows);
+		mViewportImageHovered = false;
+		if (avail.x > 1.0f && avail.y > 1.0f)
+		{
+			const float texW = (float)mClientWidth;
+			const float texH = (float)mClientHeight;
+			const float winW = avail.x;
+			const float winH = avail.y;
+
+			ImVec2 uv0(0.0f, 0.0f);
+			ImVec2 uv1(1.0f, 1.0f);
+
+			if (texW > 1.0f && texH > 1.0f)
+			{
+				const float texAspect = texW / texH;
+				const float winAspect = winW / winH;
+				if (winAspect > texAspect)
+				{
+					// Window is wider -> crop top/bottom
+					const float frac = texAspect / winAspect;
+					uv0.y = (1.0f - frac) * 0.5f;
+					uv1.y = uv0.y + frac;
+				}
+				else if (winAspect < texAspect)
+				{
+					// Window is taller -> crop left/right
+					const float frac = winAspect / texAspect;
+					uv0.x = (1.0f - frac) * 0.5f;
+					uv1.x = uv0.x + frac;
+				}
+			}
+
+			// Prefer showing TAA resolved texture if ready, otherwise show raw scene texture.
+			ImTextureID texId = ImTextureID_Invalid;
+			if (mTaaHistoryValid && mImGuiTaaHistorySrvHandle[mTaaHistoryIndex].ptr != 0)
+				texId = (ImTextureID)mImGuiTaaHistorySrvHandle[mTaaHistoryIndex].ptr;
+			else if (mImGuiSceneSrvHandle.ptr != 0)
+				texId = (ImTextureID)mImGuiSceneSrvHandle.ptr;
+
+			if (texId != ImTextureID_Invalid)
+			{
+				ImGui::Image(ImTextureRef(texId), avail, uv0, uv1);
+				mViewportImageHovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+			}
+		}
+
+		ImGui::End();
+		ImGui::PopStyleVar();
+	}
+
 	ImGui::Begin("Settings");
 	ImGui::Text("Objects\n\n");
 
@@ -871,12 +1013,32 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	ImGui::Checkbox("Enable terrain", &mTerrainEnabled);
 	ImGui::Checkbox("Wireframe (debug)", &mTerrainWireframe);
 	ImGui::DragFloat("Origin Y (above spheres)", &mTerrainOriginY, 1.0f, -100.0f, 300.0f);
-	ImGui::DragFloat("World size (XZ)", &mTerrainWorldSize, 1.0f, 10.0f, 500.0f);
-	ImGui::DragFloat("Height scale", &mTerrainHeightScale, 0.5f, 1.0f, 200.0f);
+	ImGui::DragFloat("World size (XZ)", &mTerrainWorldSize, 1.0f, 32.0f, 4096.0f);
+	ImGui::DragFloat("Height scale", &mTerrainHeightScale, 10.0f, 0.0f, 10000.0f);
+	ImGui::DragFloat("Skirt depth", &mTerrainSkirtDepth, 0.25f, 0.0f, 100.0f);
 	ImGui::DragFloat("LOD1 distance factor", &mTerrainLOD1Factor, 0.05f, 0.1f, 2.0f, "%.2f");
 	ImGui::DragFloat("LOD2 distance factor", &mTerrainLOD2Factor, 0.05f, 0.05f, 1.0f, "%.2f");
 	if (mTerrain)
+	{
 		ImGui::Text("Visible tiles: %zu", mTerrain->GetVisibleTiles().size());
+
+		// LOD debug: show how many tiles are rendered per LOD level.
+		std::array<int, kTerrainLODLevels> lodCount = {};
+		int minL = kTerrainMaxLOD;
+		int maxL = 0;
+		for (const auto& t : mTerrain->GetVisibleTiles())
+		{
+			if (t.LOD >= 0 && t.LOD < kTerrainLODLevels) lodCount[t.LOD]++;
+			minL = std::min(minL, t.LOD);
+			maxL = (std::max)(maxL, t.LOD);
+		}
+		ImGui::Text("LOD min/max: %d / %d", minL, maxL);
+		const float d1 = mTerrainWorldSize * mTerrainLOD1Factor;
+		const float d2 = mTerrainWorldSize * mTerrainLOD2Factor;
+		ImGui::Text("Split distances: L0->L1 < %.0f, L1->L2 < %.0f, L4->L5 < %.0f", d1, d2, d2 / 8.0f);
+		for (int L = 0; L <= kTerrainMaxLOD; ++L)
+			ImGui::Text("L%d: %d", L, lodCount[L]);
+	}
 	ImGui::End();
 
 	TAAConstants c = {};
@@ -900,9 +1062,10 @@ void TexColumnsApp::Update(const GameTimer& gt)
 		{
 			mTerrain->SetWorldSize(mTerrainWorldSize);
 			mTerrain->BuildQuadtree();
-			mTerrain->AssignHeightmapIndices(mTerrainHeightmapIndicesLOD0, mTerrainHeightmapIndicesLOD1, mTerrainHeightmapIndicesLOD2);
+			mTerrain->AssignTileSrvIndices(mTerrainHeightSrv, mTerrainDiffuseSrv, mTerrainNormalSrv);
 		}
-		mTerrain->Update(mMainPassCB.ViewProj, mMainPassCB.EyePosW);
+		// Use no-jitter ViewProj for stable frustum culling.
+		mTerrain->Update(mMainPassCB.ViewProjNoJitter, mMainPassCB.EyePosW);
 	}
 
 	// DXR shadow constants (updated every frame; TAA will filter noise)
@@ -950,20 +1113,20 @@ void TexColumnsApp::Update(const GameTimer& gt)
 void TexColumnsApp::RotateSpotlightTowardCursor(int x, int y)
 {
 	float px = (2.0f * x) / mClientWidth - 1.0f;
-	float py = 1.0f - (2.0f * y) / mClientHeight; // обратный y
+	float py = 1.0f - (2.0f * y) / mClientHeight; // �������� y
 
-	// 1. Получаем матрицы камеры
+	// 1. �������� ������� ������
 	XMMATRIX proj = XMLoadFloat4x4(&mProj);
-	XMMATRIX view = XMLoadFloat4x4(&mView); // используем саму камеру
+	XMMATRIX view = XMLoadFloat4x4(&mView); // ���������� ���� ������
 	XMMATRIX invView = XMMatrixInverse(nullptr, view);
 	XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
 
-	// 2. NDC → View Space
+	// 2. NDC ? View Space
 	XMVECTOR rayClip = XMVectorSet(px, py, 1.0f, 1.0f); // z = 1
 	XMVECTOR rayView = XMVector3TransformCoord(rayClip, invProj);
 	rayView = XMVectorSetW(rayView, 0.0f); 
 
-	// 3. View Space → World Space
+	// 3. View Space ? World Space
 	XMVECTOR rayDirWorld = XMVector3TransformNormal(rayView, invView);
 	rayDirWorld = XMVector3Normalize(rayDirWorld);
 
@@ -978,7 +1141,7 @@ void TexColumnsApp::RotateSpotlightTowardCursor(int x, int y)
 			XMVECTOR lightPos = XMLoadFloat3(&light.Position);
 			XMVECTOR dir = XMVector3Normalize(rayTarget - lightPos);
 
-			// Вычисляем углы вращения
+			// ��������� ���� ��������
 			float pitch = asinf(XMVectorGetY(dir)); // y
 			float yaw = atan2f(XMVectorGetX(dir), XMVectorGetZ(dir)); // x/z
 
@@ -996,7 +1159,14 @@ void TexColumnsApp::OnMouseDown(WPARAM btnState, int x, int y)
 	mLastMousePos.x = x;
 	mLastMousePos.y = y;
 
-	SetCapture(mhMainWnd);
+	const bool imguiCapturesMouse = (ImGui::GetCurrentContext() != nullptr) && ImGui::GetIO().WantCaptureMouse;
+	// Only capture the mouse when we intend to use it for camera controls (avoid fighting ImGui).
+	// Also allow camera drag when clicking inside the "Viewport" window (scene image).
+	if ((btnState & MK_LBUTTON) != 0 && (!imguiCapturesMouse || mViewportImageHovered || mViewportHovered))
+	{
+		SetCapture(mhMainWnd);
+		mViewportDragging = (mViewportImageHovered || mViewportHovered);
+	}
 	//if ((btnState & MK_LBUTTON) != 0 && !ImGui::GetIO().WantCaptureMouse)
 	//{
 	//	RotateSpotlightTowardCursor(x, y);
@@ -1005,12 +1175,15 @@ void TexColumnsApp::OnMouseDown(WPARAM btnState, int x, int y)
 
 void TexColumnsApp::OnMouseUp(WPARAM btnState, int x, int y)
 {
+	mViewportDragging = false;
 	ReleaseCapture();
 }
 
 void TexColumnsApp::OnMouseMove(WPARAM btnState, int x, int y)
 {
-	if (!ImGui::GetIO().WantCaptureMouse)
+	const bool imguiCapturesMouse = (ImGui::GetCurrentContext() != nullptr) && ImGui::GetIO().WantCaptureMouse;
+	const bool allowCamera = (mViewportDragging || mViewportImageHovered || mViewportHovered);
+	if (!imguiCapturesMouse || allowCamera)
 	{
 		if ((btnState & MK_LBUTTON) != 0)
 		{
@@ -1023,21 +1196,27 @@ void TexColumnsApp::OnMouseMove(WPARAM btnState, int x, int y)
 			cam.YawPitch(dx, -dy);
 
 		}
-		mLastMousePos.x = x;
-		mLastMousePos.y = y;
 	}
+	// Always update last position to avoid a large jump when ImGui stops capturing the mouse.
+	mLastMousePos.x = x;
+	mLastMousePos.y = y;
 }
 
 
 void TexColumnsApp::OnKeyPressed(const GameTimer& gt, WPARAM key)
 {
-	if (GET_WHEEL_DELTA_WPARAM(key) > 0 && !ImGui::GetIO().WantCaptureMouse)
+	const bool imguiCapturesMouse = (ImGui::GetCurrentContext() != nullptr) && ImGui::GetIO().WantCaptureMouse;
+	const int wheelDelta = GET_WHEEL_DELTA_WPARAM(key);
+	if (wheelDelta != 0 && !imguiCapturesMouse)
 	{
-		cam.IncreaseSpeed(0.05);
-	}
-	else if (GET_WHEEL_DELTA_WPARAM(key) < 0 && !ImGui::GetIO().WantCaptureMouse)
-	{
-		cam.IncreaseSpeed(-0.05);
+		// Mouse wheel speed control ONLY when Shift is held.
+		const bool shiftHeld = (GET_KEYSTATE_WPARAM(key) & MK_SHIFT) != 0;
+		if (shiftHeld)
+		{
+			const int steps = wheelDelta / WHEEL_DELTA; // usually ±1
+			cam.IncreaseSpeed((float)steps * 0.25f);
+		}
+		return;
 	}
 	switch (key)
 	{
@@ -1095,6 +1274,8 @@ void TexColumnsApp::UpdateCamera(const GameTimer& gt)
 	XMVECTOR up = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
 
 	XMVECTOR campos = cam.GetPosition();
+	// Keep EyePosW in sync with camera (used by lighting & terrain LOD selection).
+	XMStoreFloat3(&mEyePos, campos);
 	pos = XMVectorSet(campos.m128_f32[0], campos.m128_f32[1], campos.m128_f32[2], 0.0f);
 	target = cam.GetLook();
 	up = cam.GetUp();
@@ -1372,26 +1553,26 @@ void TexColumnsApp::UpdateMaterialCBs(const GameTimer& gt)
 
 void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 {
-	// View / Proj базовые
+	// View / Proj �������
 	XMMATRIX view = XMLoadFloat4x4(&mView);
 	XMMATRIX baseProj = XMLoadFloat4x4(&mBaseProj);
 
-	// Без jitter (для motion vectors)
+	// ��� jitter (��� motion vectors)
 	XMMATRIX viewProjNoJitter = XMMatrixMultiply(view, baseProj);
 
-	// Jitter (Halton) -> NDC offset и UV offset
+	// Jitter (Halton) -> NDC offset � UV offset
 	XMFLOAT2 h = gHalton23_8[mJitterIndex];
 
 	// NDC jitter (clip/NDC space translation)
 	float jitterNdcX = (h.x - 0.5f) * (2.0f / (float)mClientWidth);
 	float jitterNdcY = (h.y - 0.5f) * (2.0f / (float)mClientHeight);
 
-	// UV jitter (то, что надо вычитать в velocity)
+	// UV jitter (��, ��� ���� �������� � velocity)
 	XMFLOAT2 currJitterUV;
 	currJitterUV.x = jitterNdcX * 0.5f;
-	currJitterUV.y = -jitterNdcY * 0.5f; //UV y вниз
+	currJitterUV.y = -jitterNdcY * 0.5f; //UV y ����
 
-	// Jittered projection -> ViewProj (для растеризации/рендера)
+	// Jittered projection -> ViewProj (��� ������������/�������)
 	XMMATRIX jitterT = XMMatrixTranslation(jitterNdcX, jitterNdcY, 0.0f);
 	XMMATRIX proj = XMMatrixMultiply(baseProj, jitterT);
 
@@ -1402,7 +1583,7 @@ void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 	XMMATRIX invProj = XMMatrixInverse(nullptr, proj);
 	XMMATRIX invViewProj = XMMatrixInverse(nullptr, viewProj);
 
-	// Заполняем PassConstants (порядок полей должен совпадать с HLSL cbPass)
+	// ��������� PassConstants (������� ����� ������ ��������� � HLSL cbPass)
 	XMStoreFloat4x4(&mMainPassCB.View, XMMatrixTranspose(view));
 	XMStoreFloat4x4(&mMainPassCB.InvView, XMMatrixTranspose(invView));
 	XMStoreFloat4x4(&mMainPassCB.Proj, XMMatrixTranspose(proj));
@@ -1414,21 +1595,21 @@ void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 	mMainPassCB.RenderTargetSize = XMFLOAT2((float)mClientWidth, (float)mClientHeight);
 	mMainPassCB.InvRenderTargetSize = XMFLOAT2(1.0f / mClientWidth, 1.0f / mClientHeight);
 	mMainPassCB.NearZ = 1.0f;
-	mMainPassCB.FarZ = 1000.0f;
+	mMainPassCB.FarZ = 5000.0f;
 	mMainPassCB.TotalTime = gt.TotalTime();
 	mMainPassCB.DeltaTime = gt.DeltaTime();
 
 
-	// no-jitter матрицы (для velocity) 
+	// no-jitter ������� (��� velocity) 
 	XMStoreFloat4x4(&mMainPassCB.ViewProjNoJitter, XMMatrixTranspose(viewProjNoJitter));
 	XMStoreFloat4x4(&mMainPassCB.PrevViewProjNoJitter, XMMatrixTranspose(XMLoadFloat4x4(&mPrevViewProjNoJitter)));
 
-	//prev viewproj (jittered) и jitters 
+	//prev viewproj (jittered) � jitters 
 	XMStoreFloat4x4(&mMainPassCB.PrevViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mPrevViewProj)));
 	mMainPassCB.CurrJitterUV = currJitterUV;
 	mMainPassCB.PrevJitterUV = mPrevJitterUV;
 
-	// Заливка PassCB во frame resource
+	// ������� PassCB �� frame resource
 	auto currPassCB = mCurrFrameResource->PassCB.get();
 	currPassCB->CopyData(0, mMainPassCB);
 
@@ -1438,13 +1619,13 @@ void TexColumnsApp::UpdateMainPassCB(const GameTimer& gt)
 	XMStoreFloat4x4(&reproj.PrevViewProj, XMMatrixTranspose(XMLoadFloat4x4(&mPrevViewProj))); // prev jittered VP
 	mTaaReprojectCB->CopyData(0, reproj);
 
-	// Сохраняем prev для следующего кадра 
+	// ��������� prev ��� ���������� ����� 
 	XMStoreFloat4x4(&mPrevViewProj, viewProj);               // jittered
 	XMStoreFloat4x4(&mPrevViewProjNoJitter, viewProjNoJitter);
 
 	mPrevJitterUV = currJitterUV;
 
-	// индекс jitter
+	// ������ jitter
 	mJitterIndex = (mJitterIndex + 1) % kJitterCount;
 }
 
@@ -1548,7 +1729,7 @@ void TexColumnsApp::CreateGBuffer()
 	mGBufferRTVs[2] = rtvHandle;
 	rtvHandle.Offset(1, mRtvDescriptorSize);
 
-	// Velocity RTV [3]  ✅ SwapChainBufferCount+3
+	// Velocity RTV [3]  ? SwapChainBufferCount+3
 	rtvDesc.Format = velocityFormat;
 	md3dDevice->CreateRenderTargetView(mGBufferVelocity.Get(), &rtvDesc, rtvHandle);
 	mGBufferRTVs[3] = rtvHandle;
@@ -1611,14 +1792,22 @@ void TexColumnsApp::LoadTerrainTextures()
 		if (mTextures.find(name) == mTextures.end())
 			LoadTexture(name);
 	};
-	tryLoad("001/Height_Out");
-	tryLoad("002/Height/Height_Out_y0_x0");
-	tryLoad("002/Height/Height_Out_y0_x1");
-	tryLoad("002/Height/Height_Out_y1_x0");
-	tryLoad("002/Height/Height_Out_y1_x1");
-	for (int z = 0; z < 4; ++z)
-		for (int x = 0; x < 4; ++x)
-			tryLoad("003/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x));
+
+	// Homework terrain tiles: ../../Textures/terrain/Tiles/L{0..5}/{diffuse,height,normal}/tile_*_level{L}_{x}_{y}.dds
+	for (int L = 0; L <= kTerrainMaxLOD; ++L)
+	{
+		const int tilesPerSide = 1 << L;
+		for (int y = 0; y < tilesPerSide; ++y)
+		{
+			for (int x = 0; x < tilesPerSide; ++x)
+			{
+				const std::string base = "terrain/Tiles/L" + std::to_string(L) + "/";
+				tryLoad(base + "diffuse/tile_diffuse_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y));
+				tryLoad(base + "height/tile_height_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y));
+				tryLoad(base + "normal/tile_normal_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y));
+			}
+		}
+	}
 }
 
 void TexColumnsApp::LoadTexture(const std::string& name)
@@ -1646,10 +1835,12 @@ void TexColumnsApp::LoadTexture(const std::string& name)
 void TexColumnsApp::BuildRootSignature()
 {
 	CD3DX12_DESCRIPTOR_RANGE diffuseRange;
-	diffuseRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // Диффузная текстура в регистре t0
+	diffuseRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // ��������� �������� � �������� t0
 
 	CD3DX12_DESCRIPTOR_RANGE normalRange;
-	normalRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1);  // Нормальная карта в регистре t1
+	// NOTE: 2 SRVs starting at t1 (t1=diffuse for terrain, t2=normal for terrain).
+	// For regular meshes only t1 is used (normal map); t2 can be unused.
+	normalRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 1);
 
 	// Root parameter can be a table, root descriptor or root constants.
 	CD3DX12_ROOT_PARAMETER slotRootParameter[5];
@@ -1962,7 +2153,7 @@ void TexColumnsApp::CreateSpotLight(XMFLOAT3 pos, XMFLOAT3 rot, XMFLOAT3 color, 
 
 void TexColumnsApp::BuildLights()
 {
-	// Directional 1 (main sun) — включаем тени, чтобы видеть RT-тени
+	// Directional 1 (main sun) � �������� ����, ����� ������ RT-����
 	Light dir = {};
 	dir.LightCBIndex = mLights.size();
 	dir.Position = { 0, 300, 0 };
@@ -1979,7 +2170,7 @@ void TexColumnsApp::BuildLights()
 	XMStoreFloat4x4(&dir.gWorld, XMMatrixTranspose(XMMatrixScaling(1000, 1000, 1000)));
 	mLights.push_back(dir);
 
-	// Directional 2 (второй источник — сбоку, чтобы видеть вторую тень)
+	// Directional 2 (������ �������� � �����, ����� ������ ������ ����)
 	Light dir2 = {};
 	dir2.LightCBIndex = mLights.size();
 	dir2.Position = { 150, 80, 150 };
@@ -2235,9 +2426,81 @@ void TexColumnsApp::BuildDescriptorHeaps()
 				(s.find("prefilter") != std::string::npos);
 		};
 
+	// Enforce deterministic SRV layout.
+	// Important for terrain: we bind (t1,t2) as a 2-SRV range starting at diffuse,
+	// so diffuse and normal for the same tile MUST be adjacent in the heap.
+	std::vector<std::string> orderedKeys;
+	orderedKeys.reserve(mTextures.size());
+
+	auto isTerrainTile = [](const std::string& k) -> bool
+		{
+			return k.rfind("terrain/Tiles/L", 0) == 0;
+		};
+
+	// 2.1) Non-terrain textures first (sorted for stability).
+	std::vector<std::string> otherKeys;
+	otherKeys.reserve(mTextures.size());
 	for (const auto& kv : mTextures)
 	{
-		auto res = kv.second->Resource;
+		if (!isTerrainTile(kv.first))
+			otherKeys.push_back(kv.first);
+	}
+	std::sort(otherKeys.begin(), otherKeys.end());
+	orderedKeys.insert(orderedKeys.end(), otherKeys.begin(), otherKeys.end());
+
+	// 2.2) Terrain heightmaps (any order is fine).
+	for (int L = 0; L <= kTerrainMaxLOD; ++L)
+	{
+		const int tilesPerSide = 1 << L;
+		for (int y = 0; y < tilesPerSide; ++y)
+			for (int x = 0; x < tilesPerSide; ++x)
+			{
+				const std::string base = "terrain/Tiles/L" + std::to_string(L) + "/";
+				const std::string h = base + "height/tile_height_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+				if (mTextures.find(h) != mTextures.end())
+					orderedKeys.push_back(h);
+			}
+	}
+
+	// 2.3) Terrain (diffuse, normal) pairs - must be adjacent.
+	for (int L = 0; L <= kTerrainMaxLOD; ++L)
+	{
+		const int tilesPerSide = 1 << L;
+		for (int y = 0; y < tilesPerSide; ++y)
+			for (int x = 0; x < tilesPerSide; ++x)
+			{
+				const std::string base = "terrain/Tiles/L" + std::to_string(L) + "/";
+				const std::string d = base + "diffuse/tile_diffuse_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+				const std::string n = base + "normal/tile_normal_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+				if (mTextures.find(d) != mTextures.end())
+					orderedKeys.push_back(d);
+				if (mTextures.find(n) != mTextures.end())
+					orderedKeys.push_back(n);
+			}
+	}
+
+	// Safety: append any textures not covered above (should normally be empty).
+	{
+		std::unordered_set<std::string> included;
+		included.reserve(orderedKeys.size() * 2 + 1);
+		for (const auto& k : orderedKeys) included.insert(k);
+
+		std::vector<std::string> leftovers;
+		leftovers.reserve(mTextures.size());
+		for (const auto& kv : mTextures)
+			if (included.find(kv.first) == included.end())
+				leftovers.push_back(kv.first);
+		std::sort(leftovers.begin(), leftovers.end());
+		orderedKeys.insert(orderedKeys.end(), leftovers.begin(), leftovers.end());
+	}
+
+	for (const auto& key : orderedKeys)
+	{
+		auto itTex = mTextures.find(key);
+		if (itTex == mTextures.end() || itTex->second == nullptr)
+			continue;
+
+		auto res = itTex->second->Resource;
 		auto texDesc = res->GetDesc();
 		DXGI_FORMAT format = texDesc.Format;
 		if (format == DXGI_FORMAT_UNKNOWN)
@@ -2259,7 +2522,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 			const UINT arraySize = texDesc.DepthOrArraySize;
 
 			// Cubemap(s)
-			const bool cubeCandidate = (arraySize >= 6) && ((arraySize % 6) == 0) && isCubeName(kv.first);
+			const bool cubeCandidate = (arraySize >= 6) && ((arraySize % 6) == 0) && isCubeName(key);
 			if (cubeCandidate)
 			{
 				if (arraySize == 6)
@@ -2310,37 +2573,51 @@ void TexColumnsApp::BuildDescriptorHeaps()
 
 		md3dDevice->CreateShaderResourceView(res.Get(), &desc, cpuAt(baseTextures + texIndex));
 
-		TexOffsets[kv.first] = texIndex;
+		TexOffsets[key] = texIndex;
 		texIndex++;
 	}
 
-	// Terrain heightmap indices for quadtree LOD
-	mTerrainHeightmapIndicesLOD0.clear();
-	mTerrainHeightmapIndicesLOD1.clear();
-	mTerrainHeightmapIndicesLOD2.clear();
+	// Terrain SRV indices for quadtree LOD (L0..L5)
+	for (int L = 0; L < kTerrainLODLevels; ++L)
+	{
+		const int tilesPerSide = 1 << L;
+		const int count = tilesPerSide * tilesPerSide;
+		mTerrainHeightSrv[L].assign(count, -1);
+		mTerrainDiffuseSrv[L].assign(count, -1);
+		mTerrainNormalSrv[L].assign(count, -1);
+	}
 	auto texIdx = [&](const std::string& name) -> int {
 		auto it = TexOffsets.find(name);
 		return (it != TexOffsets.end()) ? it->second : -1;
 	};
-	if (texIdx("001/Height_Out") >= 0)
-		mTerrainHeightmapIndicesLOD0.push_back(texIdx("001/Height_Out"));
-	for (int z = 0; z < 2; ++z)
-		for (int x = 0; x < 2; ++x) {
-			std::string n = "002/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x);
-			if (texIdx(n) >= 0) mTerrainHeightmapIndicesLOD1.push_back(texIdx(n));
+
+	// Fallbacks (so terrain still draws if something is missing).
+	mTerrainFallbackHeightmapIndex = texIdx("textures/HeightMap2");
+	if (mTerrainFallbackHeightmapIndex < 0) mTerrainFallbackHeightmapIndex = texIdx("textures/HeightMap");
+	mTerrainFallbackDiffuseIndex = texIdx("textures/white1x1");
+	if (mTerrainFallbackDiffuseIndex < 0) mTerrainFallbackDiffuseIndex = texIdx("textures/texture");
+	mTerrainFallbackNormalIndex = texIdx("textures/default_nmap");
+	if (mTerrainFallbackNormalIndex < 0) mTerrainFallbackNormalIndex = texIdx("textures/HeightMap2");
+
+	for (int L = 0; L <= kTerrainMaxLOD; ++L)
+	{
+		const int tilesPerSide = 1 << L;
+		for (int y = 0; y < tilesPerSide; ++y)
+		{
+			for (int x = 0; x < tilesPerSide; ++x)
+			{
+				const int idx = y * tilesPerSide + x;
+				const std::string base = "terrain/Tiles/L" + std::to_string(L) + "/";
+				const std::string d = base + "diffuse/tile_diffuse_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+				const std::string h = base + "height/tile_height_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+				const std::string n = base + "normal/tile_normal_level" + std::to_string(L) + "_" + std::to_string(x) + "_" + std::to_string(y);
+
+				mTerrainHeightSrv[L][idx] = texIdx(h);
+				mTerrainDiffuseSrv[L][idx] = texIdx(d);
+				mTerrainNormalSrv[L][idx] = texIdx(n);
+			}
 		}
-	for (int z = 0; z < 4; ++z)
-		for (int x = 0; x < 4; ++x) {
-			std::string n = "003/Height/Height_Out_y" + std::to_string(z) + "_x" + std::to_string(x);
-			if (texIdx(n) >= 0) mTerrainHeightmapIndicesLOD2.push_back(texIdx(n));
-		}
-	// Fallback heightmap when 001/002/003 not loaded (so terrain still draws)
-	int fallback = texIdx("textures/HeightMap2");
-	if (fallback < 0) fallback = texIdx("textures/HeightMap");
-	if (fallback < 0 && !TexOffsets.empty()) fallback = TexOffsets.begin()->second;
-	mTerrainFallbackHeightmapIndex = (fallback >= 0) ? fallback : -1;
-	if (mTerrainHeightmapIndicesLOD0.empty() && mTerrainFallbackHeightmapIndex >= 0)
-		mTerrainHeightmapIndicesLOD0.push_back(mTerrainFallbackHeightmapIndex);
+	}
 
 	// 3) GBuffer SRV
 	D3D12_SHADER_RESOURCE_VIEW_DESC gbufSrvDesc = {};
@@ -2360,7 +2637,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	gbufSrvDesc.Format = positionFormat;
 	md3dDevice->CreateShaderResourceView(mGBufferPosition.Get(), &gbufSrvDesc, cpuAt(baseGbuffer + 2));
 
-	// Velocity SRV (отдельным desc)
+	// Velocity SRV (��������� desc)
 	D3D12_SHADER_RESOURCE_VIEW_DESC velSrvDesc = {};
 	velSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	velSrvDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
@@ -2493,12 +2770,12 @@ void TexColumnsApp::BuildShadersAndInputLayout()
 }
 void TexColumnsApp::BuildCustomMeshGeometry(std::string name, UINT& meshVertexOffset, UINT& meshIndexOffset, UINT& prevVertSize, UINT& prevIndSize, std::vector<Vertex>& vertices, std::vector<std::uint16_t>& indices, MeshGeometry* Geo)
 {
-	std::vector<GeometryGenerator::MeshData> meshDatas; // Это твоя структура для хранения вершин и индексов
+	std::vector<GeometryGenerator::MeshData> meshDatas; // ��� ���� ��������� ��� �������� ������ � ��������
 
-	// Создаем инстанс импортера.
+	// ������� ������� ���������.
 	Assimp::Importer importer;
 
-	// Читаем файл с постпроцессингом: триангуляция, флип UV (если нужно) и генерация нормалей.
+	// ������ ���� � ����������������: ������������, ���� UV (���� �����) � ��������� ��������.
 	const aiScene* scene = importer.ReadFile("../../Common/" + name + ".obj",
 		aiProcess_Triangulate |
 		aiProcess_ConvertToLeftHanded |
@@ -2517,11 +2794,11 @@ void TexColumnsApp::BuildCustomMeshGeometry(std::string name, UINT& meshVertexOf
 		GeometryGenerator::MeshData meshData;
 		aiMesh* mesh = scene->mMeshes[i];
 
-		// Подготовка контейнеров для вершин и индексов.
+		// ���������� ����������� ��� ������ � ��������.
 		std::vector<GeometryGenerator::Vertex> vertices;
 		std::vector<std::uint16_t> indices;
 
-		// Проходим по всем вершинам и копируем данные.
+		// �������� �� ���� �������� � �������� ������.
 		for (unsigned int i = 0; i < mesh->mNumVertices; ++i)
 		{
 			GeometryGenerator::Vertex v;
@@ -2554,14 +2831,14 @@ void TexColumnsApp::BuildCustomMeshGeometry(std::string name, UINT& meshVertexOf
 
 			}
 
-			// Если необходимо, можно обработать тангенты и другие атрибуты.
+			// ���� ����������, ����� ���������� �������� � ������ ��������.
 			vertices.push_back(v);
 		}
-		// Проходим по всем граням для формирования индексов.
+		// �������� �� ���� ������ ��� ������������ ��������.
 		for (unsigned int i = 0; i < mesh->mNumFaces; ++i)
 		{
 			aiFace face = mesh->mFaces[i];
-			// Убедимся, что грань треугольная.
+			// ��������, ��� ����� �����������.
 			if (face.mNumIndices != 3) continue;
 			indices.push_back(static_cast<std::uint16_t>(face.mIndices[0]));
 			indices.push_back(static_cast<std::uint16_t>(face.mIndices[1]));
@@ -2772,20 +3049,109 @@ void TexColumnsApp::BuildShapeGeometry()
 
 void TexColumnsApp::BuildTerrainGeometry()
 {
-	GeometryGenerator geoGen;
-	GeometryGenerator::MeshData grid = geoGen.CreateGrid(1.0f, 1.0f, 64, 64);
+	// Shared tile mesh: regular grid (-0.5..0.5) + skirts to hide LOD cracks.
+	// Skirt vertices are encoded by Normal.x = 1 (see Terrain.hlsl).
+	const uint32_t kCells = 64;
+	const uint32_t rows = kCells + 1;
+	const uint32_t cols = kCells + 1;
 
-	std::vector<Vertex> vertices(grid.Vertices.size());
-	for (size_t i = 0; i < grid.Vertices.size(); ++i)
+	std::vector<Vertex> vertices;
+	vertices.reserve(rows * cols + 4 * rows * 2);
+
+	for (uint32_t r = 0; r < rows; ++r)
 	{
-		const auto& gv = grid.Vertices[i];
-		vertices[i].Pos = XMFLOAT3(gv.Position.x + 0.5f, gv.Position.y, gv.Position.z + 0.5f);
-		vertices[i].Normal = gv.Normal;
-		vertices[i].TexC = gv.TexC;
-		vertices[i].Tangent = gv.TangentU;
+		const float v = (rows > 1) ? (float)r / (float)(rows - 1) : 0.0f;
+		for (uint32_t c = 0; c < cols; ++c)
+		{
+			const float u = (cols > 1) ? (float)c / (float)(cols - 1) : 0.0f;
+			Vertex vert;
+			// IMPORTANT: local XZ must be centered (-0.5..0.5), because tile world matrix translates by node Bounds.Center.
+			vert.Pos = XMFLOAT3(u - 0.5f, 0.0f, v - 0.5f);
+			vert.Normal = XMFLOAT3(0.0f, 1.0f, 0.0f); // skirt flag = 0
+			vert.TexC = XMFLOAT2(u, v); // 0..1 height/texture UVs
+			vert.Tangent = XMFLOAT3(1.0f, 0.0f, 0.0f);
+			vertices.push_back(vert);
+		}
 	}
 
-	std::vector<std::uint16_t> indices(grid.GetIndices16().begin(), grid.GetIndices16().end());
+	auto vid = [&](uint32_t r, uint32_t c) -> uint32_t { return r * cols + c; };
+
+	std::vector<std::uint32_t> indices32;
+	indices32.reserve(kCells * kCells * 6 + 4 * kCells * 6);
+
+	// Main grid
+	for (uint32_t r = 0; r < kCells; ++r)
+	{
+		for (uint32_t c = 0; c < kCells; ++c)
+		{
+			const uint32_t v00 = vid(r, c);
+			const uint32_t v10 = vid(r, c + 1);
+			const uint32_t v01 = vid(r + 1, c);
+			const uint32_t v11 = vid(r + 1, c + 1);
+
+			indices32.push_back(v00); indices32.push_back(v11); indices32.push_back(v10);
+			indices32.push_back(v00); indices32.push_back(v01); indices32.push_back(v11);
+		}
+	}
+
+	// Skirts: duplicate perimeter vertices.
+	auto addSkirtVertex = [&](uint32_t baseIndex) -> uint32_t
+		{
+			Vertex sv = vertices[baseIndex];
+			sv.Normal = XMFLOAT3(1.0f, 0.0f, 0.0f); // skirt flag = 1
+			vertices.push_back(sv);
+			return (uint32_t)vertices.size() - 1;
+		};
+
+	// Bottom edge (r=0)
+	std::vector<uint32_t> skirtBottom(cols);
+	for (uint32_t c = 0; c < cols; ++c) skirtBottom[c] = addSkirtVertex(vid(0, c));
+	for (uint32_t c = 0; c < cols - 1; ++c)
+	{
+		uint32_t v0 = vid(0, c), v1 = vid(0, c + 1);
+		uint32_t s0 = skirtBottom[c], s1 = skirtBottom[c + 1];
+		indices32.push_back(v0); indices32.push_back(v1); indices32.push_back(s0);
+		indices32.push_back(s0); indices32.push_back(v1); indices32.push_back(s1);
+	}
+
+	// Top edge (r=rows-1)
+	std::vector<uint32_t> skirtTop(cols);
+	for (uint32_t c = 0; c < cols; ++c) skirtTop[c] = addSkirtVertex(vid(rows - 1, c));
+	for (uint32_t c = 0; c < cols - 1; ++c)
+	{
+		uint32_t v0 = vid(rows - 1, c), v1 = vid(rows - 1, c + 1);
+		uint32_t s0 = skirtTop[c], s1 = skirtTop[c + 1];
+		indices32.push_back(v0); indices32.push_back(s0); indices32.push_back(v1);
+		indices32.push_back(s0); indices32.push_back(s1); indices32.push_back(v1);
+	}
+
+	// Left edge (c=0)
+	std::vector<uint32_t> skirtLeft(rows);
+	for (uint32_t r = 0; r < rows; ++r) skirtLeft[r] = addSkirtVertex(vid(r, 0));
+	for (uint32_t r = 0; r < rows - 1; ++r)
+	{
+		uint32_t v0 = vid(r, 0), v1 = vid(r + 1, 0);
+		uint32_t s0 = skirtLeft[r], s1 = skirtLeft[r + 1];
+		indices32.push_back(v0); indices32.push_back(s0); indices32.push_back(v1);
+		indices32.push_back(s0); indices32.push_back(s1); indices32.push_back(v1);
+	}
+
+	// Right edge (c=cols-1)
+	std::vector<uint32_t> skirtRight(rows);
+	for (uint32_t r = 0; r < rows; ++r) skirtRight[r] = addSkirtVertex(vid(r, cols - 1));
+	for (uint32_t r = 0; r < rows - 1; ++r)
+	{
+		uint32_t v0 = vid(r, cols - 1), v1 = vid(r + 1, cols - 1);
+		uint32_t s0 = skirtRight[r], s1 = skirtRight[r + 1];
+		indices32.push_back(v0); indices32.push_back(v1); indices32.push_back(s0);
+		indices32.push_back(s0); indices32.push_back(v1); indices32.push_back(s1);
+	}
+
+	// Convert to 16-bit indices if possible.
+	std::vector<std::uint16_t> indices;
+	indices.resize(indices32.size());
+	for (size_t i = 0; i < indices32.size(); ++i)
+		indices[i] = (std::uint16_t)indices32[i];
 
 	SubmeshGeometry terrainSubmesh;
 	terrainSubmesh.IndexCount = (UINT)indices.size();
@@ -2877,6 +3243,7 @@ void TexColumnsApp::BuildPSOs()
 		pso.RTVFormats[2] = positionFormat;
 		pso.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
 		pso.DSVFormat = mDepthStencilFormat;
+		pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; // avoid issues with tile winding / skirts
 		ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&mPSOs["terrain"])));
 	}
 	// TERRAIN WIREFRAME (debug)
@@ -2893,7 +3260,7 @@ void TexColumnsApp::BuildPSOs()
 		pso.RTVFormats[3] = DXGI_FORMAT_R16G16_FLOAT;
 		pso.DSVFormat = mDepthStencilFormat;
 		pso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
-		pso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+		pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
 		ThrowIfFailed(md3dDevice->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&mPSOs["terrain_wireframe"])));
 	}
 
@@ -3028,11 +3395,12 @@ void TexColumnsApp::BuildFrameResources()
 {
 	FlushCommandQueue();
 	mFrameResources.clear();
+	const UINT maxTerrainTiles = (1u << kTerrainMaxLOD) * (1u << kTerrainMaxLOD); // 32x32 = 1024 (worst-case)
 	for (int i = 0; i < gNumFrameResources; ++i)
 	{
-		// +1 object slot for terrain tiles
+		// Reserve enough object slots for all terrain tiles (each tile needs unique ObjectConstants).
 		mFrameResources.push_back(std::make_unique<FrameResource>(md3dDevice.Get(),
-			1, (UINT)mAllRitems.size() + 1, (UINT)mMaterials.size(), (UINT)mLights.size()));
+			1, (UINT)mAllRitems.size() + maxTerrainTiles, (UINT)mMaterials.size(), (UINT)mLights.size()));
 	}
 	mChromaticAberrationCB = std::make_unique<UploadBuffer<float>>(md3dDevice.Get(), 1, true);
 	mTaaCB = std::make_unique<UploadBuffer<TAAConstants>>(md3dDevice.Get(), 1, true);
@@ -3164,7 +3532,7 @@ void TexColumnsApp::BuildRenderItems()
 	boxRitem->BaseVertexLocation = boxRitem->Geo->DrawArgs["box"].BaseVertexLocation;
 	mAllRitems.push_back(std::move(boxRitem));
 
-	// Объект для проверки RT-теней: куб перед сценой, отбрасывает тень на землю/спонзу
+	// ������ ��� �������� RT-�����: ��� ����� ������, ����������� ���� �� �����/������
 	auto shadowTestRitem = std::make_unique<RenderItem>();
 	shadowTestRitem->Name = "shadowTestBox";
 	XMStoreFloat4x4(&shadowTestRitem->World,
@@ -3405,7 +3773,7 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 		mGBufferRTVs[3]
 	};
 
-	// Clear GBuffer (должно совпадать с clearValue при создании = Black)
+	// Clear GBuffer (������ ��������� � clearValue ��� �������� = Black)
 	for (int i = 0; i < 3; ++i)
 		mCommandList->ClearRenderTargetView(gbufferRtvs[i], Colors::Black, 0, nullptr);
 
@@ -3424,9 +3792,11 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	mCommandList->SetGraphicsRootConstantBufferView(3, passCB->GetGPUVirtualAddress());
 
 	DrawTerrain(mCommandList.Get());
+	// DrawTerrain changes PSO -> restore gbuffer PSO for regular meshes.
+	mCommandList->SetPipelineState(mPSOs["gbuffer"].Get());
 	DrawRenderItems(mCommandList.Get(), mOpaqueRitems);
 
-	// GBuffer -> SRV для lighting
+	// GBuffer -> SRV ��� lighting
 	const D3D12_RESOURCE_STATES kSrvRead =
 		(D3D12_RESOURCE_STATES)(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 	Transition(mGBufferAlbedo.Get(), mGBufferState[0], kSrvRead);
@@ -3607,7 +3977,7 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 
 		Transition(mTaaHistory[writeIdx].Get(), mTaaHistState[writeIdx], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-		// вернуть depth в DEPTH_WRITE для следующего кадра
+		// ������� depth � DEPTH_WRITE ��� ���������� �����
 		Transition(mDepthStencilBuffer.Get(), mDepthState, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 
 		mTaaHistoryIndex = writeIdx;
@@ -3615,42 +3985,30 @@ void TexColumnsApp::DeferredDraw(const GameTimer& gt)
 	}
 	else
 	{
-		// на всякий: вернуть depth
+		// �� ������: ������� depth
 		Transition(mDepthStencilBuffer.Get(), mDepthState, D3D12_RESOURCE_STATE_DEPTH_WRITE);
 	}
 
-	// 4) POST -> Backbuffer
+	// 4) Backbuffer: clear with a solid color and render ImGui.
+	// The actual scene is displayed inside the "Viewport" ImGui window as a texture.
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
 		CurrentBackBuffer(),
 		D3D12_RESOURCE_STATE_PRESENT,
 		D3D12_RESOURCE_STATE_RENDER_TARGET));
 
-	mCommandList->SetPipelineState(mPSOs["PostProcess"].Get());
 	mCommandList->OMSetRenderTargets(1, &CurrentBackBufferView(), TRUE, nullptr);
-
-	mCommandList->SetGraphicsRootSignature(mPostProcessRootSignature.Get());
-
-	// input: taa history if valid, else scene
-	if (taaReady && mTaaHistoryValid)
-		mCommandList->SetGraphicsRootDescriptorTable(0, mTaaHistorySrv[mTaaHistoryIndex]);
-	else
-		mCommandList->SetGraphicsRootDescriptorTable(0, mSceneSrvHandle);
-
-	mCommandList->SetGraphicsRootConstantBufferView(1, mChromaticAberrationCB->Resource()->GetGPUVirtualAddress());
-
-	CD3DX12_GPU_DESCRIPTOR_HANDLE luthandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-	if (CCenabled)
-		luthandle.Offset((INT)TexOffsets["textures/lut_effect"], mCbvSrvDescriptorSize);
-	else
-		luthandle.Offset((INT)TexOffsets["textures/lut_neutral"], mCbvSrvDescriptorSize);
-
-	mCommandList->SetGraphicsRootDescriptorTable(2, luthandle);
-
-	mCommandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-	mCommandList->DrawInstanced(3, 1, 0, 0);
+	{
+		// Background color of the native Win32 window (behind all ImGui windows).
+		const float clearColor[4] = { 0.08f, 0.08f, 0.10f, 1.0f };
+		mCommandList->ClearRenderTargetView(CurrentBackBufferView(), clearColor, 0, nullptr);
+	}
 
 	// ImGui
 	ImGui::Render();
+	// ImGui DX12 backend expects the CBV/SRV/UAV heap containing ImGui font SRV to be bound.
+	// We bind a dedicated heap so resize-related heap rebuilds don't break ImGui.
+	ID3D12DescriptorHeap* imguiHeaps[] = { m_ImGuiSrvDescriptorHeap.Get() };
+	mCommandList->SetDescriptorHeaps(_countof(imguiHeaps), imguiHeaps);
 	ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), mCommandList.Get());
 
 	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
@@ -3727,7 +4085,8 @@ void TexColumnsApp::DrawTerrain(ID3D12GraphicsCommandList* cmdList)
 	const auto& drawArg = geo->DrawArgs["terrain"];
 	UINT objCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(ObjectConstants));
 	UINT matCBByteSize = d3dUtil::CalcConstantBufferByteSize(sizeof(MaterialConstants));
-	const UINT terrainObjCBIndex = (UINT)mAllRitems.size();
+	const UINT terrainObjCBBase = (UINT)mAllRitems.size();
+	const UINT maxTerrainTiles = (1u << kTerrainMaxLOD) * (1u << kTerrainMaxLOD);
 	auto objectCB = mCurrFrameResource->ObjectCB.get();
 	auto matCB = mCurrFrameResource->MaterialCB->Resource();
 	Material* terrainMat = mMaterials["TerrainMat"].get();
@@ -3742,32 +4101,68 @@ void TexColumnsApp::DrawTerrain(ID3D12GraphicsCommandList* cmdList)
 	cmdList->IASetIndexBuffer(&geo->IndexBufferView());
 	cmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
+	UINT tileDraw = 0;
 	for (const TerrainTile& tile : mTerrain->GetVisibleTiles())
 	{
-		int srvIndex = (tile.HeightmapSrvIndex >= 0) ? tile.HeightmapSrvIndex : mTerrainFallbackHeightmapIndex;
-		if (srvIndex < 0) continue;
+		if (tileDraw >= maxTerrainTiles) break; // safety
+		const int heightSrv = (tile.HeightmapSrvIndex >= 0) ? tile.HeightmapSrvIndex : mTerrainFallbackHeightmapIndex;
+		const int diffuseSrv = (tile.DiffuseSrvIndex >= 0) ? tile.DiffuseSrvIndex : mTerrainFallbackDiffuseIndex;
+		const int normalSrv = (tile.NormalSrvIndex >= 0) ? tile.NormalSrvIndex : mTerrainFallbackNormalIndex;
+		if (heightSrv < 0 || diffuseSrv < 0) continue;
+
+		// RootSignature param1 is a 2-SRV range at (t1,t2). We bind it starting at diffuse.
+		// It is expected that normalSrv == diffuseSrv + 1 due to SRV ordering in BuildDescriptorHeaps.
+		const float useNormalMap = (normalSrv == diffuseSrv + 1) ? 1.0f : 0.0f;
+
+		// Match UpdateObjectCBs(): store TRANSPOSED matrices, InvWorld = inverse-transpose(non-transposed world).
 		ObjectConstants objConstants;
-		objConstants.World = tile.World;
-		objConstants.PrevWorld = tile.PrevWorld;
-		objConstants.TexTransform = MathHelper::Identity4x4();
-		XMMATRIX world = XMLoadFloat4x4(&tile.World);
-		XMVECTOR det;
-		XMStoreFloat4x4(&objConstants.InvWorld, XMMatrixInverse(&det, world));
-		objectCB->CopyData(terrainObjCBIndex, objConstants);
+
+		// tile.World/PrevWorld are already stored TRANSPOSED by Terrain::FillTileFromNode.
+		const XMMATRIX worldNT = XMMatrixTranspose(XMLoadFloat4x4(&tile.World));
+		const XMMATRIX prevWorldNT = XMMatrixTranspose(XMLoadFloat4x4(&tile.PrevWorld));
+
+		XMStoreFloat4x4(&objConstants.World, XMMatrixTranspose(worldNT));
+		XMStoreFloat4x4(&objConstants.InvWorld, MathHelper::InverseTranspose(worldNT));
+		XMStoreFloat4x4(&objConstants.PrevWorld, XMMatrixTranspose(prevWorldNT));
+
+		// Pack terrain-only params into TexTransform (non-transposed), then transpose for upload.
+		XMFLOAT4X4 texT = MathHelper::Identity4x4();
+		// Edge morphing (LOD seam fix): if neighbor is coarser on an edge, snap edge heights to coarser grid (step=2).
+		const float stepLeft = (tile.NeighborCoarserMask & 1) ? 2.0f : 1.0f;   // stored in gTexTransform._31
+		const float stepRight = (tile.NeighborCoarserMask & 2) ? 2.0f : 1.0f;  // stored in gTexTransform._32
+		const float stepBottom = (tile.NeighborCoarserMask & 4) ? 2.0f : 1.0f; // stored in gTexTransform._13
+		const float stepTop = (tile.NeighborCoarserMask & 8) ? 2.0f : 1.0f;    // stored in gTexTransform._23
+
+		// NOTE: matrices are transposed when uploaded; set texT so that after transpose we read the intended fields:
+		// g._31 <- texT[0][2], g._32 <- texT[1][2], g._13 <- texT[2][0], g._23 <- texT[2][1].
+		texT.m[0][2] = stepLeft;
+		texT.m[1][2] = stepRight;
+		texT.m[2][0] = stepBottom;
+		texT.m[2][1] = stepTop;
+
+		texT.m[2][2] = mTerrainSkirtDepth; // gTexTransform._33
+		// NOTE: matrices are transposed when uploaded; to end up in gTexTransform._34 (row3 col4),
+		// we must write (row4 col3) in the non-transposed matrix.
+		texT.m[3][2] = useNormalMap;       // gTexTransform._34
+		const XMMATRIX texTransformNT = XMLoadFloat4x4(&texT);
+		XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransformNT));
+		const UINT objIndex = terrainObjCBBase + tileDraw;
+		objectCB->CopyData(objIndex, objConstants);
 
 		CD3DX12_GPU_DESCRIPTOR_HANDLE heightmapHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-		heightmapHandle.Offset(srvIndex, mCbvSrvDescriptorSize);
+		heightmapHandle.Offset(heightSrv, mCbvSrvDescriptorSize);
 		cmdList->SetGraphicsRootDescriptorTable(0, heightmapHandle);
-		CD3DX12_GPU_DESCRIPTOR_HANDLE diffuseHandle(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
-		diffuseHandle.Offset(terrainMat->DiffuseSrvHeapIndex, mCbvSrvDescriptorSize);
-		cmdList->SetGraphicsRootDescriptorTable(1, diffuseHandle);
+		CD3DX12_GPU_DESCRIPTOR_HANDLE tileTable(mSrvDescriptorHeap->GetGPUDescriptorHandleForHeapStart());
+		tileTable.Offset(diffuseSrv, mCbvSrvDescriptorSize); // t1=diffuse, t2=normal (adjacent)
+		cmdList->SetGraphicsRootDescriptorTable(1, tileTable);
 
-		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = mCurrFrameResource->ObjectCB->Resource()->GetGPUVirtualAddress() + terrainObjCBIndex * objCBByteSize;
+		D3D12_GPU_VIRTUAL_ADDRESS objCBAddress = mCurrFrameResource->ObjectCB->Resource()->GetGPUVirtualAddress() + objIndex * objCBByteSize;
 		D3D12_GPU_VIRTUAL_ADDRESS matCBAddress = matCB->GetGPUVirtualAddress() + mTerrainMaterialIndex * matCBByteSize;
 		cmdList->SetGraphicsRootConstantBufferView(2, objCBAddress);
 		cmdList->SetGraphicsRootConstantBufferView(4, matCBAddress);
 
 		cmdList->DrawIndexedInstanced(drawArg.IndexCount, 1, drawArg.StartIndexLocation, drawArg.BaseVertexLocation, 0);
+		tileDraw++;
 	}
 }
 
@@ -4282,7 +4677,7 @@ void TexColumnsApp::CreateTaaHistoryTextures()
 	texDesc.DepthOrArraySize = 1;
 	texDesc.MipLevels = 1;
 	texDesc.Format = mBackBufferFormat; // DXGI_FORMAT_R8G8B8A8_UNORM 
-	texDesc.SampleDesc.Count = 1;       // без MSAA
+	texDesc.SampleDesc.Count = 1;       // ��� MSAA
 	texDesc.SampleDesc.Quality = 0;
 	texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -4333,7 +4728,7 @@ void TexColumnsApp::CreateTaaHistoryRtvs()
 void TexColumnsApp::BuildTaaRootSignature()
 {
 	CD3DX12_DESCRIPTOR_RANGE srvRange;
-	srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0); // t0..t4 (добавили velocity)
+	srvRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0); // t0..t4 (�������� velocity)
 
 	CD3DX12_ROOT_PARAMETER p[3];
 	p[0].InitAsDescriptorTable(1, &srvRange, D3D12_SHADER_VISIBILITY_PIXEL); // SRVs t0..t4
@@ -4371,7 +4766,7 @@ void TexColumnsApp::CreateTaaDepthHistoryTextures()
 	mTaaDepthHistory[0].Reset();
 	mTaaDepthHistory[1].Reset();
 
-	// формат должен совпадать с mDepthStencilBuffer (R24G8_TYPELESS)
+	// ������ ������ ��������� � mDepthStencilBuffer (R24G8_TYPELESS)
 	D3D12_RESOURCE_DESC d = {};
 	d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 	d.Alignment = 0;
@@ -4383,7 +4778,7 @@ void TexColumnsApp::CreateTaaDepthHistoryTextures()
 	d.SampleDesc.Count = 1;
 	d.SampleDesc.Quality = 0;
 	d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-	d.Flags = D3D12_RESOURCE_FLAG_NONE; // это НЕ depth-stencil, просто копия для чтения
+	d.Flags = D3D12_RESOURCE_FLAG_NONE; // ��� �� depth-stencil, ������ ����� ��� ������
 
 	for (int i = 0; i < 2; ++i)
 	{
@@ -4391,7 +4786,7 @@ void TexColumnsApp::CreateTaaDepthHistoryTextures()
 			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
 			D3D12_HEAP_FLAG_NONE,
 			&d,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, // будем читать в TAA
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, // ����� ������ � TAA
 			nullptr,
 			IID_PPV_ARGS(&mTaaDepthHistory[i])));
 
@@ -4400,7 +4795,7 @@ void TexColumnsApp::CreateTaaDepthHistoryTextures()
 
 	}
 
-	// при ресайзе history надо сбросить
+	// ��� ������� history ���� ��������
 	mTaaHistoryIndex = 0;
 	mTaaHistoryValid = false;
 }

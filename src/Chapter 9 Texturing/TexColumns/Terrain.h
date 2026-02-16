@@ -3,22 +3,24 @@
 #include "../../Common/d3dUtil.h"
 #include "../../Common/MathHelper.h"
 #include <DirectXCollision.h>
+#include <array>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
-// LOD levels: 0 = 001 (512), 1 = 002 (1024), 2 = 003 (2048)
-constexpr int kTerrainLODLevels = 3;
-// Tile counts per level: 1, 2x2, 4x4
-constexpr int kTerrainTilesLOD0 = 1;
-constexpr int kTerrainTilesLOD1 = 4;
-constexpr int kTerrainTilesLOD2 = 16;
+// Quadtree LOD levels: L0..L5 (6 levels total), where L5 is the most detailed.
+constexpr int kTerrainMaxLOD = 5;
+constexpr int kTerrainLODLevels = kTerrainMaxLOD + 1;
 
 struct TerrainTile
 {
-	int LOD = 0;           // 0, 1, 2
-	int TileX = 0;         // tile index in X (0..1 for LOD1, 0..3 for LOD2)
-	int TileZ = 0;         // tile index in Z
-	int HeightmapSrvIndex = -1; // index into descriptor heap for this tile's heightmap
+	int LOD = 0;                 // 0..5
+	int TileX = 0;               // tile index in X (0..(2^LOD)-1)
+	int TileZ = 0;               // tile index in Z (0..(2^LOD)-1)
+	int HeightmapSrvIndex = -1;  // SRV index for heightmap (t0)
+	int DiffuseSrvIndex = -1;    // SRV index for diffuse (t1)
+	int NormalSrvIndex = -1;     // SRV index for normal (t2)
+	std::uint8_t NeighborCoarserMask = 0; // bits: 0=left,1=right,2=bottom(-Z),3=top(+Z)
 	DirectX::BoundingBox AABB;   // world AABB for frustum culling
 	DirectX::XMFLOAT4X4 World = MathHelper::Identity4x4();
 	DirectX::XMFLOAT4X4 PrevWorld = MathHelper::Identity4x4();
@@ -32,6 +34,8 @@ struct TerrainNode
 	int TileX = 0;
 	int TileZ = 0;
 	int HeightmapSrvIndex = -1;
+	int DiffuseSrvIndex = -1;
+	int NormalSrvIndex = -1;
 	std::unique_ptr<TerrainNode> Children[4];
 	bool IsLeaf() const { return !Children[0]; }
 };
@@ -49,12 +53,10 @@ public:
 	// Height scale: heightmap value 0..1 multiplied by this
 	void SetHeightScale(float scale) { mHeightScale = scale; }
 	float GetHeightScale() const { return mHeightScale; }
-	// LOD distance thresholds (distance from camera: below LOD1 use 4 tiles, below LOD2 use 16)
+	// LOD distance thresholds (legacy 2-knob API; expanded internally for L0..L5).
 	void SetLODDistances(float maxDistLOD1, float maxDistLOD2);
-	float GetMaxDistLOD1() const { return mMaxDistLOD1; }
-	float GetMaxDistLOD2() const { return mMaxDistLOD2; }
 
-	// Build quadtree: LOD0 = 1 tile, LOD1 = 4 children, LOD2 = 16 leaves
+	// Build quadtree: L0 = 1 tile ... L5 = 32x32 tiles
 	void BuildQuadtree();
 
 	// Update visible tiles: frustum culling + LOD by distance, fill mVisibleTiles
@@ -64,10 +66,12 @@ public:
 
 	// Tile world transform and AABB for a node
 	void FillTileFromNode(const TerrainNode& node, TerrainTile& outTile) const;
-	// Assign heightmap SRV index to each node (call after textures loaded)
-	void AssignHeightmapIndices(const std::vector<int>& lod0Indices,
-		const std::vector<int>& lod1Indices,
-		const std::vector<int>& lod2Indices);
+	// Assign SRV indices to each node (call after descriptors built).
+	// Each array element is a flattened (tilesPerSide * tilesPerSide) list in row-major: idx = z*tilesPerSide + x.
+	void AssignTileSrvIndices(
+		const std::array<std::vector<int>, kTerrainLODLevels>& heightSrv,
+		const std::array<std::vector<int>, kTerrainLODLevels>& diffuseSrv,
+		const std::array<std::vector<int>, kTerrainLODLevels>& normalSrv);
 
 	const TerrainNode* GetRoot() const { return mRoot.get(); }
 	float GetWorldSizeXZ() const { return mWorldSizeXZ; }
@@ -76,16 +80,26 @@ private:
 	float mWorldSizeXZ = 100.0f;
 	float mHeightScale = 50.0f;
 	float mOriginY = 0.0f;
-	float mMaxDistLOD1 = 60.0f;
-	float mMaxDistLOD2 = 30.0f;
+	// Split distances:
+	// - L0 splits into L1 when dist < mSplitDistL0
+	// - L1 splits into L2 when dist < mSplitDistL1
+	// - Deeper levels halve the threshold each level (L2 < mSplitDistL1/2, ...).
+	float mSplitDistL0 = 0.0f;
+	float mSplitDistL1 = 0.0f;
 	std::unique_ptr<TerrainNode> mRoot;
 	std::vector<TerrainTile> mVisibleTiles;
 
-	void BuildNode(TerrainNode& node, int lod, int tileX, int tileZ, int tilesPerSide);
+	void GatherLeaves(TerrainNode& node, const DirectX::XMFLOAT4X4& viewProj, const DirectX::XMFLOAT3& eyePos,
+		std::vector<TerrainNode*>& outLeaves);
+	void BalanceLeaves(std::vector<TerrainNode*>& leaves, const DirectX::XMFLOAT4X4& viewProj, const DirectX::XMFLOAT3& eyePos);
+
+	void BuildNode(TerrainNode& node, int lod, int tileX, int tileZ);
 	bool IntersectsFrustum(const DirectX::BoundingBox& box, const DirectX::XMFLOAT4X4& viewProj) const;
 	float DistanceToNode(const DirectX::BoundingBox& box, const DirectX::XMFLOAT3& eyePos) const;
-	void SelectLOD(const TerrainNode& node, const DirectX::XMFLOAT4X4& viewProj,
-		const DirectX::XMFLOAT3& eyePos, float maxDistLOD1, float maxDistLOD2);
-	void AssignHeightmapIndicesRecursive(TerrainNode& node,
-		const std::vector<int>& lod0, const std::vector<int>& lod1, const std::vector<int>& lod2);
+	void SelectLOD(const TerrainNode& node, const DirectX::XMFLOAT4X4& viewProj, const DirectX::XMFLOAT3& eyePos);
+	void AssignTileSrvIndicesRecursive(
+		TerrainNode& node,
+		const std::array<std::vector<int>, kTerrainLODLevels>& heightSrv,
+		const std::array<std::vector<int>, kTerrainLODLevels>& diffuseSrv,
+		const std::array<std::vector<int>, kTerrainLODLevels>& normalSrv);
 };

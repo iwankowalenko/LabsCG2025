@@ -7,6 +7,8 @@
 #include "imgui.h"
 #include "imgui_impl_dx12.h"
 #include "imgui_impl_win32.h"
+#include "Camera.h"
+extern Camera cam;
 using Microsoft::WRL::ComPtr;
 using namespace std;
 using namespace DirectX;
@@ -273,8 +275,10 @@ void D3DApp::OnResize()
  
 LRESULT D3DApp::MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam))
-		return true;
+	// Let ImGui consume inputs, but do not early-return here.
+	// We want the app to still receive mouse messages (e.g. camera controls in an ImGui "Viewport" window),
+	// while higher-level code can gate behavior using io.WantCaptureMouse/Keyboard or custom rules.
+	ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
 	switch( msg )
 	{
 	// WM_ACTIVATE is sent when the window is activated or deactivated.  
@@ -368,9 +372,16 @@ LRESULT D3DApp::MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
  
 	// WM_DESTROY is sent when the window is being destroyed.
 	case WM_DESTROY:
-		ImGui_ImplDX12_Shutdown();
-		ImGui_ImplWin32_Shutdown();
-		ImGui::DestroyContext();
+		// ImGui shutdown is optional: guard it so apps that don't initialize ImGui won't assert here.
+		if (ImGui::GetCurrentContext() != nullptr)
+		{
+			ImGuiIO& io = ImGui::GetIO();
+			if (io.BackendRendererUserData != nullptr)
+				ImGui_ImplDX12_Shutdown();
+			if (io.BackendPlatformUserData != nullptr)
+				ImGui_ImplWin32_Shutdown();
+			ImGui::DestroyContext();
+		}
 		PostQuitMessage(0);
 		return 0;
 
@@ -406,6 +417,14 @@ LRESULT D3DApp::MsgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	case WM_MOUSEWHEEL:
 		OnKeyPressed(mTimer, wParam);
+		/*int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+
+		if (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT)
+		{
+			float speedDelta = (delta > 0) ? 0.05f : -0.05f;
+
+			cam.IncreaseSpeed(speedDelta);
+		}*/
 		return 0;
     case WM_KEYUP:
 		if (wParam == VK_ESCAPE)
@@ -626,7 +645,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3DApp::DepthStencilView()const
 
 void D3DApp::CalculateFrameStats()
 {
-	// Считаем количество кадров и время
+	// ??????? ?????????? ?????? ? ?????
 	static int frameCnt = 0;
 	static float timeElapsed = 0.0f;
 
@@ -635,25 +654,25 @@ void D3DApp::CalculateFrameStats()
 	float totalTime = mTimer.TotalTime();
 	float deltaTime = totalTime - timeElapsed;
 
-	// Обновляем статистику раз в секунду
+	// ????????? ?????????? ??? ? ???????
 	if (deltaTime >= 1.0f)
 	{
-		// FPS = кол-во кадров / прошедшее время (в секундах)
+		// FPS = ???-?? ?????? / ????????? ????? (? ????????)
 		float fps = frameCnt / deltaTime;
-		// mspf = миллисекунд на кадр
+		// mspf = ??????????? ?? ????
 		float mspf = 1000.0f / fps;
 
-		// Приводим к строке с нужной точностью (целые fps, одно десятичное для mspf)
+		// ???????? ? ?????? ? ?????? ????????? (????? fps, ???? ?????????? ??? mspf)
 		wchar_t buf[64];
 		swprintf(buf, 64, L"%d fps   %.1f mspf", static_cast<int>(fps), mspf);
 
-		// Строка заголовка
+		// ?????? ?????????
 		std::wstring windowText = mMainWndCaption + L"    " + buf + L"   speed: " + GetCamSpeed();
 		SetWindowText(mhMainWnd, windowText.c_str());
 
-		// Сбрасываем счётчики
+		// ?????????? ????????
 		frameCnt = 0;
-		timeElapsed += deltaTime;   // или: timeElapsed = totalTime;
+		timeElapsed += deltaTime;   // ???: timeElapsed = totalTime;
 	}
 }
 
