@@ -8,6 +8,8 @@
 #include "../../Common/UploadBuffer.h"
 #include "../../Common/GeometryGenerator.h"
 #include <filesystem>
+#include <system_error>
+#include <exception>
 #include "FrameResource.h"
 #include "Terrain.h"
 #include <iostream>
@@ -16,6 +18,7 @@
 #include <cmath>
 #include <cctype>
 #include <unordered_set>
+#include <random>
 #include <dxcapi.h>
 
 
@@ -253,6 +256,8 @@ private:
 	void CreatePointLight(XMFLOAT3 pos, XMFLOAT3 color, float faloff_start, float faloff_end, float strength);
 
 	void LoadTerrainTextures();
+	void GenerateProceduralTerrainHeightmap_PerlinFallback();
+	void CreateProceduralTextureR16_UNorm(const std::string& name, UINT width, UINT height, const std::vector<std::uint16_t>& pixels);
 	void BuildTerrainGeometry();
 	void DrawTerrain(ID3D12GraphicsCommandList* cmdList);
 	void BuildDxrShadowRootSignature();
@@ -365,7 +370,7 @@ private:
 	XMFLOAT4X4 mBaseProj = MathHelper::Identity4x4(); // projection ��� ��������
 	UINT mJitterIndex = 0;
 	static const UINT kJitterCount = 8;
-	XMFLOAT2 mJitter = XMFLOAT2(0.0f, 0.0f); 
+	XMFLOAT2 mJitter = XMFLOAT2(0.0f, 0.0f);
 
 	ComPtr<ID3D12Resource> mTaaHistory[2];
 	CD3DX12_CPU_DESCRIPTOR_HANDLE mTaaHistoryRtv[2];
@@ -399,6 +404,7 @@ private:
 	int mTerrainFallbackNormalIndex = -1;
 	bool mTerrainEnabled = true;
 	bool mTerrainWireframe = false;
+	bool mTerrainUsePerlinHeight = false; // false = original heightmap, true = procedural Perlin (in shader)
 	float mTerrainOriginY = 125.0f;  // above PBR spheres (y=120)
 	float mTerrainSkirtDepth = 5.0f;
 
@@ -527,9 +533,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE prevInstance,
 
 		return theApp.Run();
 	}
-	catch (DxException& e)
+	catch (const DxException& e)
 	{
 		MessageBox(nullptr, e.ToString().c_str(), L"HR Failed", MB_OK);
+		return 0;
+	}
+	catch (const std::exception& e)
+	{
+		MessageBoxA(nullptr, e.what(), "Unhandled std::exception", MB_OK);
+		return 0;
+	}
+	catch (...)
+	{
+		MessageBoxA(nullptr, "Unknown exception.", "Unhandled exception", MB_OK);
 		return 0;
 	}
 }
@@ -598,6 +614,7 @@ bool TexColumnsApp::Initialize()
 	BuildLights();
 	BuildShadowMapViews();
 	BuildDescriptorHeaps();
+
 	BuildShapeGeometry();
 	SetLightShapes();
 	BuildShadersAndInputLayout();
@@ -642,7 +659,7 @@ bool TexColumnsApp::Initialize()
 	init_info.Device = md3dDevice.Get();
 	init_info.CommandQueue = mCommandQueue.Get();
 	init_info.NumFramesInFlight = gNumFrameResources;
-	init_info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM; 
+	init_info.RTVFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 	init_info.DSVFormat = DXGI_FORMAT_UNKNOWN;
 	// Important: keep ImGui SRV descriptors in a dedicated heap.
 	// BuildDescriptorHeaps() is called from OnResize() and repopulates mSrvDescriptorHeap from slot 0,
@@ -655,12 +672,11 @@ bool TexColumnsApp::Initialize()
 	mImGuiInitialized = true;
 	// Create SRVs for the scene textures inside ImGui heap (do it after backend init so font SRV is created first).
 	UpdateImGuiViewportSrvs();
+
 	// Execute the initialization commands.
 	ThrowIfFailed(mCommandList->Close());
 	ID3D12CommandList* cmdsLists[] = { mCommandList.Get() };
 	mCommandQueue->ExecuteCommandLists(_countof(cmdsLists), cmdsLists);
-
-
 	FlushCommandQueue();
 	return true;
 }
@@ -783,9 +799,9 @@ void TexColumnsApp::OnResize()
 	XMMATRIX P = XMMatrixPerspectiveFovLH(0.4f * MathHelper::Pi, AspectRatio(), 1.0f, 5000.0f);
 
 	XMStoreFloat4x4(&mBaseProj, P);
-	XMStoreFloat4x4(&mProj, P); 
+	XMStoreFloat4x4(&mProj, P);
 
-	mJitterIndex = 0; 
+	mJitterIndex = 0;
 
 	// Recreate SRVs to the newly recreated textures so the ImGui viewport keeps working after resize.
 	if (mImGuiInitialized)
@@ -1015,6 +1031,7 @@ void TexColumnsApp::Update(const GameTimer& gt)
 	ImGui::DragFloat("Origin Y (above spheres)", &mTerrainOriginY, 1.0f, -100.0f, 300.0f);
 	ImGui::DragFloat("World size (XZ)", &mTerrainWorldSize, 1.0f, 32.0f, 4096.0f);
 	ImGui::DragFloat("Height scale", &mTerrainHeightScale, 10.0f, 0.0f, 10000.0f);
+	ImGui::Checkbox("Use Perlin height (procedural)", &mTerrainUsePerlinHeight);
 	ImGui::DragFloat("Skirt depth", &mTerrainSkirtDepth, 0.25f, 0.0f, 100.0f);
 	ImGui::DragFloat("LOD1 distance factor", &mTerrainLOD1Factor, 0.05f, 0.1f, 2.0f, "%.2f");
 	ImGui::DragFloat("LOD2 distance factor", &mTerrainLOD2Factor, 0.05f, 0.05f, 1.0f, "%.2f");
@@ -1124,7 +1141,7 @@ void TexColumnsApp::RotateSpotlightTowardCursor(int x, int y)
 	// 2. NDC ? View Space
 	XMVECTOR rayClip = XMVectorSet(px, py, 1.0f, 1.0f); // z = 1
 	XMVECTOR rayView = XMVector3TransformCoord(rayClip, invProj);
-	rayView = XMVectorSetW(rayView, 0.0f); 
+	rayView = XMVectorSetW(rayView, 0.0f);
 
 	// 3. View Space ? World Space
 	XMVECTOR rayDirWorld = XMVector3TransformNormal(rayView, invView);
@@ -1751,15 +1768,25 @@ void TexColumnsApp::CreateGBuffer()
 void TexColumnsApp::LoadAllTextures()
 {
 	// MEGA COSTYL
-	for (const auto& entry : std::filesystem::directory_iterator("../../Textures/textures"))
 	{
-		if (entry.is_regular_file() && entry.path().extension() == ".dds")
+		std::error_code ec;
+		std::filesystem::directory_iterator dir("../../Textures/textures", ec);
+		if (ec)
 		{
-			std::string filepath = entry.path().string();
-			filepath = filepath.substr(24, filepath.size());
-			filepath = filepath.substr(0, filepath.size() - 4);
-			filepath = "textures/" + filepath;
-			LoadTexture(filepath);
+			std::cout << "[LoadAllTextures] Cannot open ../../Textures/textures (" << ec.message() << ")\n";
+		}
+		else
+		{
+			for (const auto& entry : dir)
+			{
+				if (entry.is_regular_file() && entry.path().extension() == ".dds")
+				{
+					// Robust: use stem() instead of brittle substr() on a hardcoded prefix length.
+					const std::string stem = entry.path().stem().string();
+					const std::string key = "textures/" + stem;
+					LoadTexture(key);
+				}
+			}
 		}
 	}
 
@@ -1791,7 +1818,7 @@ void TexColumnsApp::LoadTerrainTextures()
 	auto tryLoad = [&](const std::string& name) {
 		if (mTextures.find(name) == mTextures.end())
 			LoadTexture(name);
-	};
+		};
 
 	// Homework terrain tiles: ../../Textures/terrain/Tiles/L{0..5}/{diffuse,height,normal}/tile_*_level{L}_{x}_{y}.dds
 	for (int L = 0; L <= kTerrainMaxLOD; ++L)
@@ -1808,6 +1835,187 @@ void TexColumnsApp::LoadTerrainTextures()
 			}
 		}
 	}
+}
+
+namespace
+{
+	// Deterministic, classic Perlin noise (2D). Output range ~[-1, 1].
+	struct Perlin2D
+	{
+		std::array<int, 512> p{};
+
+		static float Fade(float t) noexcept { return t * t * t * (t * (t * 6.f - 15.f) + 10.f); }
+		static float Lerp(float a, float b, float t) noexcept { return a + t * (b - a); }
+		static float Grad(int hash, float x, float y) noexcept
+		{
+			// 8 gradient directions (enough for terrain)
+			switch (hash & 7)
+			{
+			case 0: return  x + y;
+			case 1: return -x + y;
+			case 2: return  x - y;
+			case 3: return -x - y;
+			case 4: return  x;
+			case 5: return -x;
+			case 6: return  y;
+			default: return -y;
+			}
+		}
+
+		explicit Perlin2D(std::uint32_t seed = 1337u)
+		{
+			std::array<int, 256> perm{};
+			for (int i = 0; i < 256; ++i) perm[i] = i;
+
+			std::mt19937 rng(seed);
+			std::shuffle(perm.begin(), perm.end(), rng);
+
+			for (int i = 0; i < 256; ++i)
+			{
+				p[i] = perm[i];
+				p[i + 256] = perm[i];
+			}
+		}
+
+		float Noise(float x, float y) const noexcept
+		{
+			const int X = (int)std::floor(x) & 255;
+			const int Y = (int)std::floor(y) & 255;
+			x -= std::floor(x);
+			y -= std::floor(y);
+
+			const float u = Fade(x);
+			const float v = Fade(y);
+
+			const int A = p[X] + Y;
+			const int B = p[X + 1] + Y;
+
+			const float n00 = Grad(p[A], x, y);
+			const float n10 = Grad(p[B], x - 1.f, y);
+			const float n01 = Grad(p[A + 1], x, y - 1.f);
+			const float n11 = Grad(p[B + 1], x - 1.f, y - 1.f);
+
+			const float nx0 = Lerp(n00, n10, u);
+			const float nx1 = Lerp(n01, n11, u);
+			return Lerp(nx0, nx1, v);
+		}
+	};
+
+	static float Saturate(float x) noexcept { return (x < 0.f) ? 0.f : (x > 1.f) ? 1.f : x; }
+
+	// fBm based on Perlin noise. Returns [-1, 1] (normalized by total amplitude).
+	static float Fbm(const Perlin2D& pn, float x, float y, int octaves, float lacunarity, float gain) noexcept
+	{
+		float sum = 0.f;
+		float amp = 1.f;
+		float freq = 1.f;
+		float norm = 0.f;
+		for (int i = 0; i < octaves; ++i)
+		{
+			sum += amp * pn.Noise(x * freq, y * freq);
+			norm += amp;
+			amp *= gain;
+			freq *= lacunarity;
+		}
+		return (norm > 1e-6f) ? (sum / norm) : 0.f;
+	}
+}
+
+void TexColumnsApp::CreateProceduralTextureR16_UNorm(const std::string& name, UINT width, UINT height, const std::vector<std::uint16_t>& pixels)
+{
+	if (width == 0 || height == 0) return;
+	if (pixels.size() < (size_t)width * (size_t)height) return;
+
+	auto tex = std::make_unique<Texture>();
+	tex->Name = name;
+	tex->Filename = L""; // procedural
+
+	D3D12_RESOURCE_DESC texDesc = {};
+	texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	texDesc.Alignment = 0;
+	texDesc.Width = width;
+	texDesc.Height = height;
+	texDesc.DepthOrArraySize = 1;
+	texDesc.MipLevels = 1;
+	texDesc.Format = DXGI_FORMAT_R16_UNORM;
+	texDesc.SampleDesc.Count = 1;
+	texDesc.SampleDesc.Quality = 0;
+	texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+		D3D12_HEAP_FLAG_NONE,
+		&texDesc,
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		nullptr,
+		IID_PPV_ARGS(tex->Resource.GetAddressOf())));
+
+	const UINT64 uploadBufferSize = GetRequiredIntermediateSize(tex->Resource.Get(), 0, 1);
+	ThrowIfFailed(md3dDevice->CreateCommittedResource(
+		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+		D3D12_HEAP_FLAG_NONE,
+		&CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize),
+		D3D12_RESOURCE_STATE_GENERIC_READ,
+		nullptr,
+		IID_PPV_ARGS(tex->UploadHeap.GetAddressOf())));
+
+	D3D12_SUBRESOURCE_DATA subResourceData = {};
+	subResourceData.pData = pixels.data();
+	subResourceData.RowPitch = (LONG_PTR)width * sizeof(std::uint16_t);
+	subResourceData.SlicePitch = subResourceData.RowPitch * (LONG_PTR)height;
+
+	UpdateSubresources<1>(mCommandList.Get(), tex->Resource.Get(), tex->UploadHeap.Get(), 0, 0, 1, &subResourceData);
+
+	mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(
+		tex->Resource.Get(),
+		D3D12_RESOURCE_STATE_COPY_DEST,
+		D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE));
+
+	// Insert / replace.
+	mTextures[name] = std::move(tex);
+}
+
+void TexColumnsApp::GenerateProceduralTerrainHeightmap_PerlinFallback()
+{
+	// One global procedural heightmap (sampled per-tile with uv 0..1).
+	// Higher resolution makes normals smoother; R16_UNORM keeps memory reasonable.
+	const UINT hmW = 1024;
+	const UINT hmH = 1024;
+
+	// Noise parameters in UV space (0..1).
+	const std::uint32_t seed = 1337u;
+	const int octaves = 7;
+	const float baseFrequency = 5.0f;  // features across 0..1
+	const float lacunarity = 2.0f;
+	const float gain = 0.5f;
+
+	Perlin2D pn(seed);
+	std::vector<std::uint16_t> pixels;
+	pixels.resize((size_t)hmW * (size_t)hmH);
+
+	for (UINT y = 0; y < hmH; ++y)
+	{
+		const float v = ((float)y + 0.5f) / (float)hmH; // 0..1
+		for (UINT x = 0; x < hmW; ++x)
+		{
+			const float u = ((float)x + 0.5f) / (float)hmW; // 0..1
+
+			float n = Fbm(pn, u * baseFrequency, v * baseFrequency, octaves, lacunarity, gain);
+			float h = n * 0.5f + 0.5f; // -> [0,1]
+
+			// Shape a bit: flatter lowlands, sharper peaks.
+			h = std::pow(Saturate(h), 1.35f);
+			h = Saturate(h);
+
+			const std::uint16_t hv = (std::uint16_t)std::lround(h * 65535.0f);
+			pixels[(size_t)y * (size_t)hmW + (size_t)x] = hv;
+		}
+	}
+
+	// Override/define fallback heightmaps so terrain uses the procedural one.
+	CreateProceduralTextureR16_UNorm("textures/HeightMap2", hmW, hmH, pixels);
+	CreateProceduralTextureR16_UNorm("textures/HeightMap", hmW, hmH, pixels);
 }
 
 void TexColumnsApp::LoadTexture(const std::string& name)
@@ -2501,10 +2709,19 @@ void TexColumnsApp::BuildDescriptorHeaps()
 			continue;
 
 		auto res = itTex->second->Resource;
+		if (!res)
+		{
+			std::cout << "[BuildDescriptorHeaps] Texture has null resource: " << key << "\n";
+			continue;
+		}
 		auto texDesc = res->GetDesc();
 		DXGI_FORMAT format = texDesc.Format;
 		if (format == DXGI_FORMAT_UNKNOWN)
-			abort();
+		{
+			// Don't hard-abort the whole app on a single bad texture; just skip it.
+			std::cout << "[BuildDescriptorHeaps] Skipping texture with DXGI_FORMAT_UNKNOWN: " << key << "\n";
+			continue;
+		}
 
 		D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
 		desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -2589,7 +2806,7 @@ void TexColumnsApp::BuildDescriptorHeaps()
 	auto texIdx = [&](const std::string& name) -> int {
 		auto it = TexOffsets.find(name);
 		return (it != TexOffsets.end()) ? it->second : -1;
-	};
+		};
 
 	// Fallbacks (so terrain still draws if something is missing).
 	mTerrainFallbackHeightmapIndex = texIdx("textures/HeightMap2");
@@ -4144,6 +4361,9 @@ void TexColumnsApp::DrawTerrain(ID3D12GraphicsCommandList* cmdList)
 		// NOTE: matrices are transposed when uploaded; to end up in gTexTransform._34 (row3 col4),
 		// we must write (row4 col3) in the non-transposed matrix.
 		texT.m[3][2] = useNormalMap;       // gTexTransform._34
+		// Height mode flag (we use _44 which is otherwise 1 in Identity):
+		// 1.0 = original heightmap sampling, 2.0 = procedural Perlin height.
+		texT.m[3][3] = mTerrainUsePerlinHeight ? 2.0f : 1.0f;
 		const XMMATRIX texTransformNT = XMLoadFloat4x4(&texT);
 		XMStoreFloat4x4(&objConstants.TexTransform, XMMatrixTranspose(texTransformNT));
 		const UINT objIndex = terrainObjCBBase + tileDraw;
@@ -4254,238 +4474,238 @@ void TexColumnsApp::BuildDxrAccelerationStructures()
 		ComPtr<ID3D12GraphicsCommandList4> cmd4;
 		ThrowIfFailed(mCommandList.As(&cmd4));
 
-	// Cache BLAS per unique (Geo + submesh range).
-	struct BlasKey
-	{
-		MeshGeometry* Geo = nullptr;
-		UINT IndexCount = 0;
-		UINT StartIndexLocation = 0;
-		INT BaseVertexLocation = 0;
-	};
-	struct BlasKeyHash
-	{
-		size_t operator()(const BlasKey& k) const noexcept
+		// Cache BLAS per unique (Geo + submesh range).
+		struct BlasKey
 		{
-			size_t h = std::hash<void*>()(k.Geo);
-			auto hc = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
-			hc(std::hash<UINT>()(k.IndexCount));
-			hc(std::hash<UINT>()(k.StartIndexLocation));
-			hc(std::hash<int>()(k.BaseVertexLocation));
-			return h;
-		}
-	};
-	struct BlasKeyEq
-	{
-		bool operator()(const BlasKey& a, const BlasKey& b) const noexcept
+			MeshGeometry* Geo = nullptr;
+			UINT IndexCount = 0;
+			UINT StartIndexLocation = 0;
+			INT BaseVertexLocation = 0;
+		};
+		struct BlasKeyHash
 		{
-			return a.Geo == b.Geo &&
-				a.IndexCount == b.IndexCount &&
-				a.StartIndexLocation == b.StartIndexLocation &&
-				a.BaseVertexLocation == b.BaseVertexLocation;
+			size_t operator()(const BlasKey& k) const noexcept
+			{
+				size_t h = std::hash<void*>()(k.Geo);
+				auto hc = [&](size_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+				hc(std::hash<UINT>()(k.IndexCount));
+				hc(std::hash<UINT>()(k.StartIndexLocation));
+				hc(std::hash<int>()(k.BaseVertexLocation));
+				return h;
+			}
+		};
+		struct BlasKeyEq
+		{
+			bool operator()(const BlasKey& a, const BlasKey& b) const noexcept
+			{
+				return a.Geo == b.Geo &&
+					a.IndexCount == b.IndexCount &&
+					a.StartIndexLocation == b.StartIndexLocation &&
+					a.BaseVertexLocation == b.BaseVertexLocation;
+			}
+		};
+
+		std::unordered_map<BlasKey, UINT, BlasKeyHash, BlasKeyEq> blasIndex;
+		struct BlasBuild
+		{
+			BlasKey Key;
+			D3D12_RAYTRACING_GEOMETRY_DESC Geom = {};
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS Inputs = {};
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO Info = {};
+		};
+		std::vector<BlasBuild> builds;
+		builds.reserve(mOpaqueRitems.size());
+
+		UINT64 maxScratch = 0;
+		for (auto ri : mOpaqueRitems)
+		{
+			if (!ri || !ri->Geo || !ri->Geo->VertexBufferGPU || !ri->Geo->IndexBufferGPU)
+				continue;
+
+			BlasKey key;
+			key.Geo = ri->Geo;
+			key.IndexCount = ri->IndexCount;
+			key.StartIndexLocation = ri->StartIndexLocation;
+			key.BaseVertexLocation = ri->BaseVertexLocation;
+
+			if (blasIndex.find(key) != blasIndex.end())
+				continue;
+
+			BlasBuild b;
+			b.Key = key;
+
+			const UINT stride = sizeof(Vertex);
+			const UINT totalVerts = (UINT)(key.Geo->VertexBufferByteSize / stride);
+			const UINT vertsFromBase = (totalVerts > (UINT)max(0, key.BaseVertexLocation)) ? (totalVerts - (UINT)key.BaseVertexLocation) : totalVerts;
+
+			b.Geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+			b.Geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+			b.Geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+			b.Geom.Triangles.VertexCount = vertsFromBase;
+			b.Geom.Triangles.VertexBuffer.StartAddress =
+				key.Geo->VertexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.BaseVertexLocation * stride;
+			b.Geom.Triangles.VertexBuffer.StrideInBytes = stride;
+
+			const DXGI_FORMAT idxFmt = key.Geo->IndexFormat;
+			const UINT idxStride = (idxFmt == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
+			b.Geom.Triangles.IndexFormat = idxFmt;
+			b.Geom.Triangles.IndexCount = key.IndexCount;
+			b.Geom.Triangles.IndexBuffer =
+				key.Geo->IndexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.StartIndexLocation * idxStride;
+			b.Geom.Triangles.Transform3x4 = 0;
+
+			b.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+			b.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+			b.Inputs.NumDescs = 1;
+			b.Inputs.pGeometryDescs = &b.Geom;
+			b.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+
+			device5->GetRaytracingAccelerationStructurePrebuildInfo(&b.Inputs, &b.Info);
+			maxScratch = max(maxScratch, b.Info.ScratchDataSizeInBytes);
+
+			UINT idx = (UINT)builds.size();
+			blasIndex[key] = idx;
+			builds.push_back(std::move(b));
+			// Fix pointer after move: Inputs.pGeometryDescs must point to the element's own Geom.
+			builds[idx].Inputs.pGeometryDescs = &builds[idx].Geom;
 		}
-	};
 
-	std::unordered_map<BlasKey, UINT, BlasKeyHash, BlasKeyEq> blasIndex;
-	struct BlasBuild
-	{
-		BlasKey Key;
-		D3D12_RAYTRACING_GEOMETRY_DESC Geom = {};
-		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS Inputs = {};
-		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO Info = {};
-	};
-	std::vector<BlasBuild> builds;
-	builds.reserve(mOpaqueRitems.size());
+		if (builds.empty())
+		{
+			mEnableDxrShadows = false;
+			return;
+		}
 
-	UINT64 maxScratch = 0;
-	for (auto ri : mOpaqueRitems)
-	{
-		if (!ri || !ri->Geo || !ri->Geo->VertexBufferGPU || !ri->Geo->IndexBufferGPU)
-			continue;
-
-		BlasKey key;
-		key.Geo = ri->Geo;
-		key.IndexCount = ri->IndexCount;
-		key.StartIndexLocation = ri->StartIndexLocation;
-		key.BaseVertexLocation = ri->BaseVertexLocation;
-
-		if (blasIndex.find(key) != blasIndex.end())
-			continue;
-
-		BlasBuild b;
-		b.Key = key;
-
-		const UINT stride = sizeof(Vertex);
-		const UINT totalVerts = (UINT)(key.Geo->VertexBufferByteSize / stride);
-		const UINT vertsFromBase = (totalVerts > (UINT)max(0, key.BaseVertexLocation)) ? (totalVerts - (UINT)key.BaseVertexLocation) : totalVerts;
-
-		b.Geom.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-		b.Geom.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-		b.Geom.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-		b.Geom.Triangles.VertexCount = vertsFromBase;
-		b.Geom.Triangles.VertexBuffer.StartAddress =
-			key.Geo->VertexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.BaseVertexLocation * stride;
-		b.Geom.Triangles.VertexBuffer.StrideInBytes = stride;
-
-		const DXGI_FORMAT idxFmt = key.Geo->IndexFormat;
-		const UINT idxStride = (idxFmt == DXGI_FORMAT_R32_UINT) ? 4u : 2u;
-		b.Geom.Triangles.IndexFormat = idxFmt;
-		b.Geom.Triangles.IndexCount = key.IndexCount;
-		b.Geom.Triangles.IndexBuffer =
-			key.Geo->IndexBufferGPU->GetGPUVirtualAddress() + (UINT64)key.StartIndexLocation * idxStride;
-		b.Geom.Triangles.Transform3x4 = 0;
-
-		b.Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
-		b.Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-		b.Inputs.NumDescs = 1;
-		b.Inputs.pGeometryDescs = &b.Geom;
-		b.Inputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-
-		device5->GetRaytracingAccelerationStructurePrebuildInfo(&b.Inputs, &b.Info);
-		maxScratch = max(maxScratch, b.Info.ScratchDataSizeInBytes);
-
-		UINT idx = (UINT)builds.size();
-		blasIndex[key] = idx;
-		builds.push_back(std::move(b));
-		// Fix pointer after move: Inputs.pGeometryDescs must point to the element's own Geom.
-		builds[idx].Inputs.pGeometryDescs = &builds[idx].Geom;
-	}
-
-	if (builds.empty())
-	{
-		mEnableDxrShadows = false;
-		return;
-	}
-
-	// Scratch for BLAS builds (reused).
-	ThrowIfFailed(md3dDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(maxScratch, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-		nullptr,
-		IID_PPV_ARGS(&mDxrBlasScratch)));
-
-	mDxrBlas.clear();
-	mDxrBlas.resize(builds.size());
-
-	for (UINT i = 0; i < (UINT)builds.size(); ++i)
-	{
-		UINT64 resultSize = builds[i].Info.ResultDataMaxSizeInBytes;
+		// Scratch for BLAS builds (reused).
 		ThrowIfFailed(md3dDevice->CreateCommittedResource(
 			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
 			D3D12_HEAP_FLAG_NONE,
-			&CD3DX12_RESOURCE_DESC::Buffer(resultSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+			&CD3DX12_RESOURCE_DESC::Buffer(maxScratch, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			nullptr,
+			IID_PPV_ARGS(&mDxrBlasScratch)));
+
+		mDxrBlas.clear();
+		mDxrBlas.resize(builds.size());
+
+		for (UINT i = 0; i < (UINT)builds.size(); ++i)
+		{
+			UINT64 resultSize = builds[i].Info.ResultDataMaxSizeInBytes;
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+				D3D12_HEAP_FLAG_NONE,
+				&CD3DX12_RESOURCE_DESC::Buffer(resultSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+				D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+				nullptr,
+				IID_PPV_ARGS(&mDxrBlas[i])));
+
+			D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
+			desc.Inputs = builds[i].Inputs;
+			desc.DestAccelerationStructureData = mDxrBlas[i]->GetGPUVirtualAddress();
+			desc.ScratchAccelerationStructureData = mDxrBlasScratch->GetGPUVirtualAddress();
+			cmd4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
+			mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrBlas[i].Get()));
+		}
+
+		// TLAS instances (one per opaque render item, stable order).
+		mDxrInstances.clear();
+		mDxrInstances.reserve(mOpaqueRitems.size());
+		for (auto ri : mOpaqueRitems)
+		{
+			if (!ri || !ri->Geo) continue;
+
+			BlasKey key;
+			key.Geo = ri->Geo;
+			key.IndexCount = ri->IndexCount;
+			key.StartIndexLocation = ri->StartIndexLocation;
+			key.BaseVertexLocation = ri->BaseVertexLocation;
+
+			auto it = blasIndex.find(key);
+			if (it == blasIndex.end()) continue;
+
+			mDxrInstances.push_back({ ri, it->second });
+		}
+
+		const UINT instanceCount = (UINT)mDxrInstances.size();
+		if (instanceCount == 0)
+		{
+			mEnableDxrShadows = false;
+			return;
+		}
+
+		const UINT64 instanceBufferSize = (UINT64)instanceCount * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+
+		// Per-frame instance buffers to avoid CPU/GPU races when updating transforms.
+		mDxrInstanceDescs.clear();
+		mDxrInstanceDescs.resize((size_t)gNumFrameResources);
+		for (int fi = 0; fi < gNumFrameResources; ++fi)
+		{
+			ThrowIfFailed(md3dDevice->CreateCommittedResource(
+				&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+				D3D12_HEAP_FLAG_NONE,
+				&CD3DX12_RESOURCE_DESC::Buffer(instanceBufferSize),
+				D3D12_RESOURCE_STATE_GENERIC_READ,
+				nullptr,
+				IID_PPV_ARGS(&mDxrInstanceDescs[fi])));
+
+			D3D12_RAYTRACING_INSTANCE_DESC* mapped = nullptr;
+			ThrowIfFailed(mDxrInstanceDescs[fi]->Map(0, nullptr, (void**)&mapped));
+
+			for (UINT i = 0; i < instanceCount; ++i)
+			{
+				RenderItem* ri = mDxrInstances[i].Ri;
+				const UINT blasIdx = mDxrInstances[i].BlasIndex;
+				D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
+				memset(&inst, 0, sizeof(inst));
+				inst.InstanceID = i;
+				inst.InstanceContributionToHitGroupIndex = 0;
+				inst.InstanceMask = 0xFF;
+				inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+
+				// Row-major 3x4 transform from RenderItem world matrix.
+				const XMFLOAT4X4& W = ri->World;
+				for (int r = 0; r < 3; ++r)
+					for (int c = 0; c < 4; ++c)
+						inst.Transform[r][c] = W.m[r][c];
+
+				inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
+			}
+			mDxrInstanceDescs[fi]->Unmap(0, nullptr);
+		}
+
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
+		tlasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+		tlasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+		tlasInputs.NumDescs = instanceCount;
+		tlasInputs.InstanceDescs = mDxrInstanceDescs.empty() ? 0 : mDxrInstanceDescs[0]->GetGPUVirtualAddress();
+		tlasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
+			D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+
+		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlasInfo = {};
+		device5->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &tlasInfo);
+
+		const UINT64 tlasScratchSize = max(tlasInfo.ScratchDataSizeInBytes, tlasInfo.UpdateScratchDataSizeInBytes);
+		ThrowIfFailed(md3dDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(tlasScratchSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+			D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+			nullptr,
+			IID_PPV_ARGS(&mDxrTlasScratch)));
+
+		ThrowIfFailed(md3dDevice->CreateCommittedResource(
+			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+			D3D12_HEAP_FLAG_NONE,
+			&CD3DX12_RESOURCE_DESC::Buffer(tlasInfo.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
 			D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
 			nullptr,
-			IID_PPV_ARGS(&mDxrBlas[i])));
+			IID_PPV_ARGS(&mDxrTlas)));
 
-		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc = {};
-		desc.Inputs = builds[i].Inputs;
-		desc.DestAccelerationStructureData = mDxrBlas[i]->GetGPUVirtualAddress();
-		desc.ScratchAccelerationStructureData = mDxrBlasScratch->GetGPUVirtualAddress();
-		cmd4->BuildRaytracingAccelerationStructure(&desc, 0, nullptr);
-		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrBlas[i].Get()));
-	}
-
-	// TLAS instances (one per opaque render item, stable order).
-	mDxrInstances.clear();
-	mDxrInstances.reserve(mOpaqueRitems.size());
-	for (auto ri : mOpaqueRitems)
-	{
-		if (!ri || !ri->Geo) continue;
-
-		BlasKey key;
-		key.Geo = ri->Geo;
-		key.IndexCount = ri->IndexCount;
-		key.StartIndexLocation = ri->StartIndexLocation;
-		key.BaseVertexLocation = ri->BaseVertexLocation;
-
-		auto it = blasIndex.find(key);
-		if (it == blasIndex.end()) continue;
-
-		mDxrInstances.push_back({ ri, it->second });
-	}
-
-	const UINT instanceCount = (UINT)mDxrInstances.size();
-	if (instanceCount == 0)
-	{
-		mEnableDxrShadows = false;
-		return;
-	}
-
-	const UINT64 instanceBufferSize = (UINT64)instanceCount * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
-
-	// Per-frame instance buffers to avoid CPU/GPU races when updating transforms.
-	mDxrInstanceDescs.clear();
-	mDxrInstanceDescs.resize((size_t)gNumFrameResources);
-	for (int fi = 0; fi < gNumFrameResources; ++fi)
-	{
-		ThrowIfFailed(md3dDevice->CreateCommittedResource(
-			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
-			D3D12_HEAP_FLAG_NONE,
-			&CD3DX12_RESOURCE_DESC::Buffer(instanceBufferSize),
-			D3D12_RESOURCE_STATE_GENERIC_READ,
-			nullptr,
-			IID_PPV_ARGS(&mDxrInstanceDescs[fi])));
-
-		D3D12_RAYTRACING_INSTANCE_DESC* mapped = nullptr;
-		ThrowIfFailed(mDxrInstanceDescs[fi]->Map(0, nullptr, (void**)&mapped));
-
-		for (UINT i = 0; i < instanceCount; ++i)
-		{
-			RenderItem* ri = mDxrInstances[i].Ri;
-			const UINT blasIdx = mDxrInstances[i].BlasIndex;
-			D3D12_RAYTRACING_INSTANCE_DESC& inst = mapped[i];
-			memset(&inst, 0, sizeof(inst));
-			inst.InstanceID = i;
-			inst.InstanceContributionToHitGroupIndex = 0;
-			inst.InstanceMask = 0xFF;
-			inst.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
-
-			// Row-major 3x4 transform from RenderItem world matrix.
-			const XMFLOAT4X4& W = ri->World;
-			for (int r = 0; r < 3; ++r)
-				for (int c = 0; c < 4; ++c)
-					inst.Transform[r][c] = W.m[r][c];
-
-			inst.AccelerationStructure = mDxrBlas[blasIdx]->GetGPUVirtualAddress();
-		}
-		mDxrInstanceDescs[fi]->Unmap(0, nullptr);
-	}
-
-	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
-	tlasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
-	tlasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-	tlasInputs.NumDescs = instanceCount;
-	tlasInputs.InstanceDescs = mDxrInstanceDescs.empty() ? 0 : mDxrInstanceDescs[0]->GetGPUVirtualAddress();
-	tlasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE |
-		D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
-
-	D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlasInfo = {};
-	device5->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &tlasInfo);
-
-	const UINT64 tlasScratchSize = max(tlasInfo.ScratchDataSizeInBytes, tlasInfo.UpdateScratchDataSizeInBytes);
-	ThrowIfFailed(md3dDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(tlasScratchSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-		nullptr,
-		IID_PPV_ARGS(&mDxrTlasScratch)));
-
-	ThrowIfFailed(md3dDevice->CreateCommittedResource(
-		&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
-		D3D12_HEAP_FLAG_NONE,
-		&CD3DX12_RESOURCE_DESC::Buffer(tlasInfo.ResultDataMaxSizeInBytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-		D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
-		nullptr,
-		IID_PPV_ARGS(&mDxrTlas)));
-
-	D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlasDesc = {};
-	tlasDesc.Inputs = tlasInputs;
-	tlasDesc.DestAccelerationStructureData = mDxrTlas->GetGPUVirtualAddress();
-	tlasDesc.ScratchAccelerationStructureData = mDxrTlasScratch->GetGPUVirtualAddress();
-	cmd4->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
+		D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlasDesc = {};
+		tlasDesc.Inputs = tlasInputs;
+		tlasDesc.DestAccelerationStructureData = mDxrTlas->GetGPUVirtualAddress();
+		tlasDesc.ScratchAccelerationStructureData = mDxrTlasScratch->GetGPUVirtualAddress();
+		cmd4->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
 		mCommandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::UAV(mDxrTlas.Get()));
 	}
 	catch (const DxException&)
@@ -4692,7 +4912,7 @@ void TexColumnsApp::CreateTaaHistoryTextures()
 			&CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
 			D3D12_HEAP_FLAG_NONE,
 			&texDesc,
-			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, 
+			D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
 			&clearValue,
 			IID_PPV_ARGS(&mTaaHistory[i])
 		));
